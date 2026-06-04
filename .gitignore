@@ -219,8 +219,8 @@ __marimo__/
 .streamlit/config.toml
 
 # Database
-data/anime.db
-data/anime.db-journal
+*.db
+*.db-journal
 
 # Archive data
 data/archive/
