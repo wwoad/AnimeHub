@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.streamlit/config.toml
+
+# Database
+data/anime.db
+data/anime.db-journal
+
+# Archive data
+data/archive/
+
+# Nul file
+nul
