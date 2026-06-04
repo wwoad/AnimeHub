@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: anime_hub
+Version: 0.3.0
+Summary: 动画数据采集与分析框架
+Requires-Python: >=3.10
+Requires-Dist: httpx>=0.27
+Requires-Dist: tenacity>=8.2
+Requires-Dist: SQLAlchemy>=2.0
+Requires-Dist: pandas>=2.1
+Requires-Dist: openpyxl>=3.1
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: pydantic>=2.0
+Requires-Dist: pydantic-settings>=2.0
+Requires-Dist: tqdm>=4.66
+Requires-Dist: streamlit>=1.58
+Requires-Dist: plotly>=6.0
+Provides-Extra: dev
+Requires-Dist: watchfiles>=0.21; extra == "dev"

@@ -1,0 +1,69 @@
+[project]
+name = "anime_hub"
+version = "0.3.0"
+description = "动画数据采集与分析框架"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27",
+    "tenacity>=8.2",
+    "SQLAlchemy>=2.0",
+    "pandas>=2.1",
+    "openpyxl>=3.1",
+    "matplotlib>=3.8",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "tqdm>=4.66",
+    "streamlit>=1.58",
+    "plotly>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "watchfiles>=0.21",
+]
+
+[project.scripts]
+anime-hub = "main:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main", "config"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 1000
+target-version = "py310"
+indent-width = 4
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes (逻辑/语法错误)
+    "W",   # pycodestyle warnings
+    "I",   # isort (import 排序)
+    "N",   # pep8-naming (命名规范)
+    "UP",  # pyupgrade (现代语法升级)
+    "SIM", # 简化代码
+]
+ignore = [
+    "E501",   # 行太长由 formatter 处理
+    "RUF001", # 中文字符在字符串中
+    "RUF002", # 中文字符在文档字符串中
+    "RUF003", # 中文字符在注释中
+]
+fixable = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"test_*.py" = ["S101"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
