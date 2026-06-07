@@ -44,8 +44,8 @@ def get_raw_path(
     platform: str = "bilibili",
     date_str: str | None = None,
 ) -> Path:
-    """获取原始数据 Excel 路径: .../{title_slug}/{title_slug}.xlsx"""
-    return get_anime_dir(title_slug, platform, date_str) / f"{title_slug}.xlsx"
+    """获取原始数据路径: data/archive/{date}/{platform}/{title_slug}.xlsx"""
+    return DATA_DIR / (date_str or get_date_str()) / platform / f"{title_slug}.xlsx"
 
 
 def get_analysis_dir(

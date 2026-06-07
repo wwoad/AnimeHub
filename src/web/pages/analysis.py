@@ -1,9 +1,8 @@
-"""数据分析: 总览/排行榜/对比/趋势/详情
-
-内容区第一行右侧放平台选择器。
-"""
+"""数据分析: 平台总览/排行榜/聚焦分析"""
 
 from __future__ import annotations
+
+import re
 
 import pandas as pd
 import plotly.express as px
@@ -20,7 +19,139 @@ def _fmt(n: int) -> str:
     return f"{n:,}"
 
 
+def _fmt_label(n: float) -> str:
+    if n == 0:
+        return "0"
+    if n < 1:
+        return f"{n * 100:.1f}%"
+    if n >= 100_000_000:
+        return f"{n / 100_000_000:.2f}亿"
+    if n >= 10_000:
+        return f"{n / 10_000:.1f}万"
+    return f"{n:,.0f}"
+
+
 _METRIC_CN = {"views": "播放量", "follow": "追番", "danmaku": "弹幕", "likes": "点赞", "coins": "投币"}
+_BAR_COLOR = "#448AFF"
+_PIE_COLORS = px.colors.qualitative.Dark24
+
+_CHART_DARK = dict(
+    template="plotly_dark",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+)
+
+
+def _fmt_table(df: pd.DataFrame, metric: str, top_n: int) -> pd.DataFrame:
+    """按 metric 排序，取 TOP N，只展示原始指标列"""
+    sorted_df = df.nlargest(top_n, metric)
+    rank_cols = ["标题", "追番", "播放量", "弹幕", "点赞", "投币", "收藏", "分享"]
+    show_cols = [c for c in rank_cols if c in sorted_df.columns]
+    show = sorted_df[show_cols].copy()
+    for c in show_cols:
+        if c != "标题":
+            show[c] = show[c].apply(lambda x: _fmt(int(x)))
+    return show
+
+
+def _get_decay_ratios(metric_cn: str) -> pd.DataFrame:
+    """查询留存率: 后半集均 ÷ 首集（按集号 title 排序定位首集）"""
+    from collections import defaultdict
+
+    from sqlalchemy import func
+
+    from db.session import get_session_factory
+    from models.episode import Episode
+    from models.episode_stat import EpisodeStat
+
+    col_map = {"播放量": "views", "弹幕": "danmaku", "点赞": "likes", "投币": "coins", "收藏": "favorite", "分享": "share"}
+    col = col_map.get(metric_cn)
+    if col is None:
+        return pd.DataFrame()
+
+    Session = get_session_factory()
+    with Session() as session:
+        eps = session.query(Episode).all()
+        if not eps:
+            return pd.DataFrame()
+
+        anime_eps: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        all_ep_ids = []
+        for ep in eps:
+            try:
+                ep_num = int(ep.title.strip())
+            except (ValueError, AttributeError):
+                ep_num = 0
+            anime_eps[ep.anime_id].append((ep_num, ep.ep_id))
+            all_ep_ids.append(ep.ep_id)
+
+        if not all_ep_ids:
+            return pd.DataFrame()
+
+        subq = session.query(EpisodeStat.episode_id, func.max(EpisodeStat.id).label("max_id")).filter(EpisodeStat.episode_id.in_(all_ep_ids)).group_by(EpisodeStat.episode_id).subquery()
+        stats = session.query(EpisodeStat).join(subq, EpisodeStat.id == subq.c.max_id).all()
+        stat_map = {s.episode_id: getattr(s, col, 0) for s in stats}
+
+    rows = []
+    for sid, eps_list in anime_eps.items():
+        if len(eps_list) < 4:
+            continue
+        eps_list.sort(key=lambda x: x[0])
+        first_ep_id = eps_list[0][1]
+        first_val = stat_map.get(first_ep_id, 0)
+        if first_val <= 0:
+            continue
+        rest = [e[1] for e in eps_list[1:]]
+        half_start = len(rest) // 2
+        half_vals = [stat_map.get(eid, 0) for eid in rest[half_start:] if stat_map.get(eid, 0) > 0]
+        if len(half_vals) < 2:
+            continue
+        half_avg = sum(half_vals) / len(half_vals)
+        decay = round(half_avg / first_val, 4)
+        rows.append({"season_id": sid, "decay_ratio": decay})
+
+    return pd.DataFrame(rows)
+
+
+def _merge_series(df: pd.DataFrame) -> pd.DataFrame:
+    """合并同系列动画：按根标题（去「第X季」「之XXX」后缀）分组，播放量等求和，追番取最大值"""
+    import re
+
+    df = df.copy()
+
+    _season_re = re.compile(r"\s*第[\d零一二三四五六七八九十.]+季$")
+    _branch_re = re.compile(r"之[\u4e00-\u9fa5]{3,}$")
+    _dot_re = re.compile(r"[·：][\u4e00-\u9fa5]+$")
+    _arc_re = re.compile(r"\s[\u4e00-\u9fa5]+篇$")
+    _num_re = re.compile(r"\s*\d+$")
+    _code_re = re.compile(r"\s*[A-Za-z]+$")
+
+    def _root_title(t: str) -> str:
+        return _code_re.sub("", _num_re.sub("", _arc_re.sub("", _dot_re.sub("", _branch_re.sub("", _season_re.sub("", str(t)))))))
+
+    df["_root"] = df["title"].apply(_root_title)
+    df["_group_key"] = df["season_type"].astype(str) + "_" + df["_root"]
+
+    _sum_cols = ["播放量", "弹幕", "点赞", "投币", "收藏", "分享", "集数"]
+    _max_cols = ["追番"]
+    agg: dict[str, str] = {}
+    for c in _sum_cols:
+        if c in df.columns:
+            agg[c] = "sum"
+    for c in _max_cols:
+        if c in df.columns:
+            agg[c] = "max"
+    for c in df.columns:
+        if c not in agg and c not in ("_group_key", "_root"):
+            agg[c] = "first"
+
+    merged = df.groupby("_group_key", as_index=False).agg(agg)
+    for c in _sum_cols + _max_cols:
+        if c in merged.columns:
+            merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0).astype("int64")
+    merged["title"] = merged["title"].apply(_root_title)
+    merged.drop(columns=["_group_key"], inplace=True)
+    return merged
 
 
 def render_analysis() -> None:
@@ -36,105 +167,241 @@ def render_analysis() -> None:
         st.info(f"{platform} 平台暂无跟踪动画")
         return
 
-    sub1, sub2, sub3, sub4 = st.tabs(["🏆 排行榜", "📊 对比分析", "📈 增长趋势", "🎯 聚焦分析"])
+    tab_overview, tab_ranking, tab_focus = st.tabs(["📊 平台总览", "🏆 排行榜", "🎯 聚焦分析"])
 
-    with sub1:
+    with tab_overview:
+        _overview(plat_df, platform)
+
+    with tab_ranking:
         _ranking(plat_df, platform)
 
-    with sub2:
-        _compare(plat_df, platform)
+    with tab_focus:
+        _focus(plat_df, platform)
 
-    with sub3:
-        _trend(plat_df, platform)
 
-    with sub4:
-        _detail(plat_df, platform)
+def _overview(df: pd.DataFrame, platform: str) -> None:
+    st.subheader(f"{platform} 平台总览")
+
+    total = len(df)
+    total_views = int(df["views"].sum())
+    total_follow = int(df["follow"].sum())
+    finished = int((df["is_finish"] == "完结").sum())
+    airing = int((df["is_finish"] == "连载中").sum())
+
+    cols = st.columns(4)
+    with cols[0]:
+        st.metric("🎬 追踪动画", total)
+    with cols[1]:
+        st.metric("▶ 总播放量", _fmt(total_views))
+    with cols[2]:
+        st.metric("❤ 总追番数", _fmt(total_follow))
+    with cols[3]:
+        st.metric("✅ 完结 / 连载", f"{finished} / {airing}")
+
+    st.markdown("---")
+
+    rank_cols = st.columns(3)
+    metrics = [("views", "播放量 TOP5"), ("follow", "追番 TOP5"), ("rating_score", "评分 TOP5")]
+    for col, (metric, title) in zip(rank_cols, metrics):
+        with col:
+            st.markdown(f"**{title}**")
+            top5 = df.nlargest(5, metric)[["title", metric]]
+            for i, (_, row) in enumerate(top5.iterrows(), 1):
+                val = _fmt(int(row[metric])) if metric != "rating_score" else f"{row[metric]:.1f}"
+                st.markdown(f"{i}. **{row['title']}** — {val}")
+
+    st.markdown("---")
+
+    dist_cols = st.columns(2)
+    with dist_cols[0]:
+        area_counts = df["area"].value_counts()
+        if not area_counts.empty:
+            fig = px.pie(values=area_counts.values, names=area_counts.index, title="地区分布", color_discrete_sequence=_PIE_COLORS)
+            fig.update_layout(height=250, margin=dict(l=20, r=20, t=30, b=10), **_CHART_DARK)
+            st.plotly_chart(fig, width="stretch")
+
+    with dist_cols[1]:
+        status_counts = df["is_finish"].value_counts()
+        if not status_counts.empty:
+            fig = px.pie(values=status_counts.values, names=status_counts.index, title="状态分布", color_discrete_sequence=_PIE_COLORS)
+            fig.update_layout(height=250, margin=dict(l=20, r=20, t=30, b=10), **_CHART_DARK)
+            st.plotly_chart(fig, width="stretch")
+
+    st.markdown("---")
+    st.markdown("**全部动画数据**")
+    display_cols = ["标题", "地区", "评分", "集数", "播放量", "追番", "弹幕", "状态"]
+    show = df[[c for c in display_cols if c in df.columns]].copy()
+    for c in ["播放量", "追番", "弹幕"]:
+        if c in show.columns:
+            show[c] = show[c].apply(lambda x: _fmt(int(x)))
+    if "评分" in show.columns:
+        show["评分"] = show["评分"].apply(lambda x: f"{float(x):.1f}")
+    st.dataframe(show, width="stretch", height=max(200, min(400, 40 + len(show) * 35)), hide_index=True)
 
 
 def _ranking(df: pd.DataFrame, platform: str) -> None:
     st.subheader(f"{platform} 排行榜")
 
-    metric = st.selectbox("排行指标", list(_METRIC_CN.keys()), format_func=lambda x: _METRIC_CN[x], key=f"rank_metric_{platform}")
-
-    top = df.sort_values(metric, ascending=False).head(20)
-
-    rank_data = pd.DataFrame(
-        {
-            "排名": range(1, len(top) + 1),
-            "标题": top["title"].values,
-            "地区": top["area"].values if "area" in top.columns else [""] * len(top),
-            _METRIC_CN[metric]: top[metric].values,
+    df = df.rename(
+        columns={
+            "views": "播放量",
+            "follow": "追番",
+            "danmaku": "弹幕",
+            "likes": "点赞",
+            "coins": "投币",
+            "favorite": "收藏",
+            "share": "分享",
+            "rating_score": "评分",
+            "total_episodes": "集数",
         }
     )
 
-    fig = px.bar(rank_data, x=_METRIC_CN[metric], y="标题", orientation="h", title=f"TOP {len(top)} {_METRIC_CN[metric]}排行")
-    fig.update_layout(yaxis={"categoryorder": "total ascending"})
-    st.plotly_chart(fig, width="stretch")
-    st.dataframe(rank_data.astype(str), width="stretch", height=max(200, min(500, 40 + len(rank_data) * 35)), hide_index=True)
+    _ml_re = re.compile(r"(?:日语|粤配|粤语|英语|英文|国语|中配|日配|国配|原声)版?$")
+    df = df[~df["title"].str.contains(_ml_re, na=False, regex=True)]
 
+    df = df[~((df["season_type"] == 4) & (df["集数"] == 0))]
 
-def _compare(df: pd.DataFrame, platform: str) -> None:
-    st.subheader(f"{platform} 对比分析")
+    raw_metrics = ["播放量", "追番", "弹幕", "点赞", "投币", "收藏", "分享"]
+    ratio_metrics = ["播放量", "追番", "弹幕", "点赞", "投币", "收藏", "分享"]
+    rank_modes = ["原始数据", "比率", "特殊统计"]
 
-    all_titles = df["title"].tolist()
-    selected = st.multiselect("选择要对比的动画（最多5部）", all_titles, default=all_titles[: min(2, len(all_titles))], key=f"compare_sel_{platform}")
+    col_area, col_type, col_mode, col_metric, col_mode2, col_sort, col_merge, col_search, col_topn = st.columns([0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 1.8])
+    with col_area:
+        area_opt = st.selectbox("地区", ["全部", "中国", "国外"], key="rank_area")
+    with col_type:
+        type_opt = st.selectbox("类型", ["全部", "番剧", "电影"], key="rank_type")
+    with col_mode:
+        rank_mode = st.selectbox("模式", rank_modes, key="rank_mode")
+    with col_sort:
+        rank_asc = st.selectbox("排序", ["降序", "升序"], key="rank_asc") == "升序"
+    with col_merge:
+        rank_merge = st.selectbox("系列", ["分开展示", "合并系列"], disabled=rank_mode == "特殊统计", key="rank_merge")
+    with col_search:
+        search_text = st.text_input("搜索", key="rank_search", placeholder="选中动画名称...")
+    with col_topn:
+        top_n = st.slider("显示作品数", 5, 50, 20, key="rank_topn")
 
-    if len(selected) < 2:
-        st.info("请选择至少2部动画进行对比")
+    if area_opt == "中国":
+        df = df[df["area"].str.startswith("中国", na=False)]
+    elif area_opt == "国外":
+        df = df[df["area"].notna() & (df["area"] != "") & ~df["area"].str.startswith("中国", na=False)]
+    if type_opt == "番剧":
+        df = df[df["season_type"] == 4]
+    elif type_opt == "电影":
+        df = df[df["season_type"] == 2]
+
+    if rank_merge == "合并系列" and rank_mode != "特殊统计":
+        df = _merge_series(df)
+
+    if type_opt == "全部" and "season_type" in df.columns:
+        _mask = df["season_type"] == 2
+        df.loc[_mask, "title"] = "*" + df.loc[_mask, "title"]
+
+    if rank_mode == "原始数据":
+        with col_metric:
+            metric = st.selectbox("指标", raw_metrics, index=0, key="rank_metric")
+        with col_mode2:
+            submode = st.selectbox("取值", ["总数", "集均"], key="rank_submode")
+        if submode == "集均":
+            col_name = f"集均{metric}"
+            df[col_name] = (df[metric] / df["集数"].replace(0, 1)).round(2)
+            metric = col_name
+    elif rank_mode == "比率":
+        with col_metric:
+            num = st.selectbox("分子", ratio_metrics, index=3, key="rank_num")
+        with col_mode2:
+            den = st.selectbox("分母", ratio_metrics, index=0, key="rank_den")
+            use_per_ep = st.checkbox("☑集均(分子)", key="rank_ratio_eperp")
+        if use_per_ep:
+            col_name = f"集均{num}/{den}"
+            df[col_name] = ((df[num] / df["集数"].replace(0, 1)) / df[den].replace(0, 1) * 100).round(2)
+        else:
+            col_name = f"{num}/{den}"
+            df[col_name] = (df[num] / df[den].replace(0, 1) * 100).round(2)
+        metric = col_name
+    else:
+        with col_metric:
+            decay_metric = st.selectbox("指标", ratio_metrics, index=0, key="rank_decay_metric")
+        decay_df = _get_decay_ratios(decay_metric)
+        if decay_df.empty:
+            st.warning("暂无首集衰减数据，需先爬取动画的集数数据")
+            return
+        metric = f"留存率({decay_metric})"
+        df = df.merge(decay_df, on="season_id", how="left")
+        df[metric] = df["decay_ratio"].fillna(0)
+        top = df.nlargest(top_n, metric)
+        if not rank_asc:
+            top = top.iloc[::-1]
+        top["_label"] = top[metric].apply(_fmt_label)
+        max_val = top[metric].max()
+        if pd.isna(max_val):
+            st.info("当前筛选条件下无数据")
+            return
+        if metric.startswith("集均"):
+            step = 10_000_000
+            tick_vals = [i * step for i in range(int(max_val / step) + 2)]
+            tick_texts = [f"{v / 100_000_000:.1f}亿" for v in tick_vals]
+        else:
+            step = 500_000_000
+            tick_vals = [i * step for i in range(int(max_val / step) + 2)]
+            tick_texts = [f"{v // 100_000_000}亿" for v in tick_vals]
+        title_text = f"Top{top_n} {metric}"
+        top["_match"] = top["title"].str.contains(search_text, case=False, na=False) if search_text else False
+        top["_rank"] = list(range(len(top), 0, -1))
+        fig = px.bar(top, x=metric, y="title", orientation="h", title=title_text, text=top["_label"], custom_data=["_rank"], labels={"title": "动画标题"})
+        fig.data[0].marker.color = ["#FFB300" if m else _BAR_COLOR for m in top["_match"]]
+        fig.update_layout(yaxis={"categoryorder": "trace"}, height=750, bargap=0.15, title_x=0.5, title_font=dict(size=14), margin=dict(t=45, b=10, l=10, r=30), **_CHART_DARK)
+        fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="rgba(128,128,128,0.12)", zeroline=False, tickfont=dict(size=10), tickvals=tick_vals, ticktext=tick_texts)
+        fig.update_yaxes(showgrid=False, zeroline=False, tickfont=dict(size=10))
+        fig.update_traces(textposition="outside", textfont=dict(size=10), marker=dict(cornerradius=6, line=dict(width=1, color="rgba(100,180,255,0.25)")), hovertemplate="<b>#%{customdata[0]}</b> %{y}: %{x}<extra></extra>")
+        st.plotly_chart(fig, width="stretch")
+        if type_opt == "全部":
+            st.caption("💡 * 标记为电影")
+        st.dataframe(_fmt_table(df, metric or "播放量", top_n), width="stretch", height=max(200, min(500, 40 + len(top) * 35)), hide_index=True)
         return
 
-    metrics = ["views", "follow", "danmaku", "likes", "coins"]
-    compare_rows = []
-    for _, row in df[df["title"].isin(selected)].iterrows():
-        entry = {"标题": row["title"]}
-        for m in metrics:
-            entry[_METRIC_CN[m]] = int(row[m]) if m in row.index and pd.notna(row[m]) else 0
-        compare_rows.append(entry)
+    top = df.nlargest(top_n, metric)
+    if not rank_asc:
+        top = top.iloc[::-1]
+    top["_label"] = top[metric].apply(_fmt_label)
+    max_val = top[metric].max()
+    if pd.isna(max_val):
+        st.info("当前筛选条件下无数据")
+        return
+    if metric.startswith("集均"):
+        step = 10_000_000
+        tick_vals = [i * step for i in range(int(max_val / step) + 2)]
+        tick_texts = [f"{v / 100_000_000:.1f}亿" for v in tick_vals]
+    else:
+        step = 500_000_000
+        tick_vals = [i * step for i in range(int(max_val / step) + 2)]
+        tick_texts = [f"{v // 100_000_000}亿" for v in tick_vals]
 
-    compare_df = pd.DataFrame(compare_rows)
-    st.dataframe(compare_df.astype(str), width="stretch", hide_index=True)
+    title_text = f"Top{top_n} {metric}"
 
-    melt_df = compare_df.melt(id_vars=["标题"], value_vars=[_METRIC_CN[m] for m in metrics], var_name="指标", value_name="数值")
-    fig = px.bar(melt_df, x="指标", y="数值", color="标题", barmode="group", title="多动画指标对比")
+    top["_match"] = top["title"].str.contains(search_text, case=False, na=False) if search_text else False
+    top["_rank"] = list(range(len(top), 0, -1))
+    fig = px.bar(top, x=metric, y="title", orientation="h", title=title_text, text=top["_label"], custom_data=["_rank"], labels={"title": "动画标题"})
+    fig.data[0].marker.color = ["#FFB300" if m else _BAR_COLOR for m in top["_match"]]
+    fig.update_layout(yaxis={"categoryorder": "trace"}, height=750, bargap=0.15, title_x=0.5, title_font=dict(size=14), margin=dict(t=45, b=10, l=10, r=30), **_CHART_DARK)
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="rgba(128,128,128,0.12)", zeroline=False, tickfont=dict(size=10), tickvals=tick_vals, ticktext=tick_texts)
+    fig.update_yaxes(showgrid=False, zeroline=False, tickfont=dict(size=10))
+    fig.update_traces(textposition="outside", textfont=dict(size=10), marker=dict(cornerradius=6, line=dict(width=1, color="rgba(100,180,255,0.25)")), hovertemplate="<b>#%{customdata[0]}</b> %{y}: %{x}<extra></extra>")
     st.plotly_chart(fig, width="stretch")
 
+    if type_opt == "全部":
+        st.caption("💡 * 标记为电影")
 
-def _trend(df: pd.DataFrame, platform: str) -> None:
-    st.subheader(f"{platform} 增长趋势")
+    st.dataframe(_fmt_table(df, metric, top_n), width="stretch", height=max(200, min(500, 40 + len(top) * 35)), hide_index=True)
 
+
+def _focus(df: pd.DataFrame, platform: str) -> None:
     titles = df["title"].tolist()
     if not titles:
-        st.info("暂无动画数据")
-        return
-
-    idx = st.selectbox("选择动画", range(len(titles)), format_func=lambda i: titles[i], key=f"trend_sel_{platform}")
-    season_id = int(df.iloc[idx]["season_id"])
-
-    history_df = get_anime_stat_history(season_id, days=30)
-    if history_df.empty:
-        st.info("暂无历史数据，需多次爬取后才能查看趋势")
-        return
-
-    metric = st.selectbox("趋势指标", ["播放量", "追番", "弹幕", "点赞", "投币"], key=f"trend_metric_{platform}")
-    if metric not in history_df.columns:
-        st.warning(f"数据中没有 {metric} 字段")
-        return
-
-    fig = px.line(history_df, x="时间", y=metric, title=f"{titles[idx]} - {metric}趋势")
-    st.plotly_chart(fig, width="stretch")
-    st.dataframe(history_df.astype(str), width="stretch", hide_index=True)
-
-
-def _detail(df: pd.DataFrame, platform: str) -> None:
-    titles_list = df["title"].tolist()
-    if not titles_list:
         st.info("该平台暂无动画")
         return
 
-    cols = st.columns([2, 1, 1, 1, 1, 1, 1, 1, 1])
-    with cols[0]:
-        idx = st.selectbox("动画", range(len(titles_list)), format_func=lambda i: titles_list[i], key=f"detail_sel_{platform}")
-
+    idx = st.selectbox("选择动画", range(len(titles)), format_func=lambda i: titles[i], key="focus_sel")
     season_id = int(df.iloc[idx]["season_id"])
     detail = get_anime_detail(season_id)
 
@@ -144,50 +411,86 @@ def _detail(df: pd.DataFrame, platform: str) -> None:
 
     anime, stat, episodes = detail["anime"], detail["stat"], detail["episodes"]
 
-    with cols[1]:
-        st.metric("评分", f"{anime.rating_score}({anime.rating_count}人)")
-    with cols[2]:
-        st.metric("集数", anime.total_episodes)
-    with cols[3]:
-        st.metric("播放量", _fmt(stat.views) if stat else "暂无")
-    with cols[4]:
-        st.metric("弹幕", _fmt(stat.danmaku) if stat else "暂无")
-    with cols[5]:
-        st.metric("点赞", _fmt(stat.likes) if stat else "暂无")
-    with cols[6]:
-        st.metric("收藏", _fmt(stat.favorite) if stat else "暂无")
-    with cols[7]:
-        st.metric("分享", _fmt(stat.share) if stat else "暂无")
-    with cols[8]:
-        st.metric("状态", "完结" if anime.is_finish else "连载中")
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        st.markdown(f"### {anime.title}")
+        st.markdown(f"**地区**: {anime.area or '无'} &nbsp;&nbsp; **风格**: {anime.styles or '无'} &nbsp;&nbsp; **状态**: {'✅ 完结' if anime.is_finish else '🔄 连载中'}")
+        st.markdown(f"**简介**: {anime.evaluate or '无'}")
 
-    st.markdown(f"**风格**: {anime.styles or '无'}")
-    st.markdown(f"**简介**: {anime.evaluate or '无'}")
+    with c2:
+        st.markdown(f"**评分**: {anime.rating_score or '暂无'} ({_fmt(anime.rating_count)}人)")
+        st.markdown(f"**集数**: {anime.total_episodes}")
+        st.markdown(f"**UP主**: {anime.up_name or '无'}")
 
     st.markdown("---")
-    st.subheader(f"正片数据 ({len(episodes)} 集)")
+
+    m_cols = st.columns(7)
+    metrics_data = [
+        ("播放量", stat.views if stat else 0),
+        ("追番", stat.follow if stat else 0),
+        ("弹幕", stat.danmaku if stat else 0),
+        ("点赞", stat.likes if stat else 0),
+        ("投币", stat.coins if stat else 0),
+        ("收藏", stat.favorite if stat else 0),
+        ("分享", stat.share if stat else 0),
+    ]
+    for col, (label, val) in zip(m_cols, metrics_data):
+        with col:
+            st.metric(label, _fmt(int(val)) if val else "暂无")
+
+    st.markdown("---")
 
     if episodes:
-        rows = [
-            {
-                "集号": ep.get("title", ""),
-                "标题": ep.get("long_title", ""),
-                "BV号": ep.get("bvid", ""),
-                "播放量": ep.get("views", 0),
-                "弹幕": ep.get("danmaku", 0),
-                "评论": ep.get("reply", 0),
-                "收藏": ep.get("favorite", 0),
-                "点赞": ep.get("likes", 0),
-                "投币": ep.get("coins", 0),
-                "分享": ep.get("share", 0),
-            }
-            for ep in episodes
-        ]
-        ep_df = pd.DataFrame(rows)
-        display = ep_df.copy()
-        for col in ["播放量", "弹幕", "评论", "收藏", "点赞", "投币", "分享"]:
-            if col in display.columns:
-                display[col] = display[col].astype(str).apply(lambda v: _fmt(int(v)) if v.isdigit() and int(v) >= 10_000 else v)
-        st.dataframe(display, width="stretch", height=max(200, min(400, 40 + len(display) * 35)), hide_index=True)
+        st.subheader(f"集数数据 ({len(episodes)} 集)")
+
+        ep_cols = st.columns([2, 1])
+        with ep_cols[0]:
+            rows = [
+                {
+                    "集号": ep.get("title", ""),
+                    "标题": ep.get("long_title", ""),
+                    "播放量": _fmt(int(ep.get("views", 0))),
+                    "弹幕": _fmt(int(ep.get("danmaku", 0))),
+                    "点赞": _fmt(int(ep.get("likes", 0))),
+                }
+                for ep in episodes
+            ]
+            ep_df = pd.DataFrame(rows)
+            st.dataframe(ep_df, width="stretch", height=max(200, min(400, 40 + len(ep_df) * 35)), hide_index=True)
+
+        with ep_cols[1]:
+            ep_metric = st.selectbox("集数指标", ["播放量", "弹幕", "点赞"], key="ep_metric")
+            ep_chart_data = pd.DataFrame(
+                {
+                    "集号": [ep.get("title", f"#{i + 1}") for i, ep in enumerate(episodes)],
+                    ep_metric: [ep.get({"播放量": "views", "弹幕": "danmaku", "点赞": "likes"}[ep_metric], 0) for ep in episodes],
+                }
+            )
+            ep_chart_data["_label"] = ep_chart_data[ep_metric].apply(_fmt_label)
+            emax = ep_chart_data[ep_metric].max()
+            estep = 500_000_000
+            etick_vals = [i * estep for i in range(int(emax / estep) + 2)]
+            etick_texts = [f"{v // 100_000_000}亿" for v in etick_vals]
+            fig = px.bar(ep_chart_data, x="集号", y=ep_metric, title=f"各集{ep_metric}分布", text=ep_chart_data["_label"], color_discrete_sequence=[_BAR_COLOR])
+            fig.update_layout(height=400, margin=dict(l=10, r=10, t=40, b=50), bargap=0.15, title_font=dict(size=14), **_CHART_DARK)
+            fig.update_xaxes(showgrid=False, zeroline=False, tickfont=dict(size=10))
+            fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="rgba(128,128,128,0.12)", zeroline=False, tickfont=dict(size=10), tickvals=etick_vals, ticktext=etick_texts)
+            fig.update_traces(textposition="outside", textfont=dict(size=10), marker=dict(cornerradius=6, line=dict(width=1, color="rgba(100,180,255,0.25)")))
+            st.plotly_chart(fig, width="stretch")
     else:
         st.info("暂无集数数据")
+
+    st.markdown("---")
+    st.subheader("历史趋势")
+
+    history_df = get_anime_stat_history(season_id, days=30)
+    if history_df.empty:
+        st.info("暂无历史数据，需多次爬取后才能查看趋势")
+    else:
+        trend_metric = st.selectbox("趋势指标", ["播放量", "追番", "弹幕", "点赞", "投币"], key="trend_metric")
+        if trend_metric in history_df.columns:
+            fig = px.line(history_df, x="时间", y=trend_metric, title=f"{anime.title} - {trend_metric}趋势", color_discrete_sequence=["#00E5FF"])
+            fig.update_layout(height=400, **_CHART_DARK)
+            st.plotly_chart(fig, width="stretch")
+            with st.expander("查看历史数据表"):
+                st.dataframe(history_df, width="stretch", hide_index=True)

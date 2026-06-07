@@ -17,58 +17,25 @@ from cli.tracking import cmd_add, cmd_import, cmd_pause, cmd_resume, cmd_sync
 from config import get_settings
 
 
-def _dev_run_streamlit(app_path: str, port: int) -> None:
-    """watchfiles 的回调：重启 Streamlit 子进程"""
-    import subprocess
-
-    subprocess.run(
-        [
-            sys.executable, "-m", "streamlit", "run",
-            app_path,
-            "--server.port", str(port),
-            "--server.fileWatcherType", "none",
-            "--server.headless", "true",
-        ],
-    )
-
-
-def cmd_dev(args: any) -> None:
-    """启动开发服务器 (全范围热更新: cli/core/db 等变更自动重启)"""
-    try:
-        import watchfiles
-    except ModuleNotFoundError:
-        print("❌ 缺少 watchfiles，请安装: pip install -e .[dev]", file=sys.stderr)
-        sys.exit(1)
-
-    from pathlib import Path
-
-    app_path = str(Path(__file__).resolve().parent / "web" / "app.py")
-    root = Path(app_path).parent.parent.parent
-    port = getattr(args, "port", 8501)
-
-    print(f"启动开发服务器: http://localhost:{port}  (热更新已就绪)")
-    watchfiles.run_process(
-        root / "src",
-        root / ".streamlit",
-        root / "pyproject.toml",
-        root / "data",
-        target=_dev_run_streamlit,
-        kwargs={"app_path": app_path, "port": port},
-    )
-
-
 def cmd_web(args: any) -> None:
-    """启动 Streamlit Web UI (配置由 .streamlit/config.toml 控制)"""
+    """启动 Streamlit Web UI
+
+    热更新 (HMR): 由 .streamlit/config.toml 控制
+    """
     import subprocess
     from pathlib import Path
 
     app_path = Path(__file__).resolve().parent / "web" / "app.py"
     port = getattr(args, "port", 8501)
 
+    cmd = [
+        sys.executable, "-m", "streamlit", "run", str(app_path),
+        "--server.port", str(port),
+        "--server.headless", "true",
+    ]
+
     print(f"启动 Web UI: http://localhost:{port}")
-    subprocess.run(
-        [sys.executable, "-m", "streamlit", "run", str(app_path), "--server.port", str(port)],
-    )
+    subprocess.run(cmd)
 
 
 def _setup_logging() -> None:
@@ -171,10 +138,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--order", type=int, default=2, help="排序方式(2=追番数, 3=播放量, 5=评分)")
 
     # — Web UI —
-    p = sub.add_parser("web", help="启动Streamlit Web界面")
+    p = sub.add_parser("web", help="启动 Web UI (热更新)")
     p.add_argument("--port", type=int, default=8501, help="端口号(默认8501)")
 
-    p = sub.add_parser("dev", help="启动开发服务器(全文件热更新)")
+    p = sub.add_parser("dev", help="启动 Web UI (同 web 命令)")
     p.add_argument("--port", type=int, default=8501, help="端口号(默认8501)")
 
     return parser
@@ -205,7 +172,7 @@ def main() -> None:
         "diff": cmd_diff,
         "discover": cmd_discover,
         "web": cmd_web,
-        "dev": cmd_dev,
+        "dev": cmd_web,
     }
     commands[args.command](args)
 

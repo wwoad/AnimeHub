@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import datetime
 
 import pandas as pd
@@ -26,6 +27,21 @@ from models.crawl_task import CrawlTask
 from models.episode_stat import EpisodeStat
 
 logger = logging.getLogger(__name__)
+
+_progress_listeners: list[Callable[[int, str, int, int], None]] = []
+
+
+def add_progress_listener(fn: Callable[[int, str, int, int], None]) -> None:
+    _progress_listeners.append(fn)
+
+
+def remove_progress_listener(fn: Callable[[int, str, int, int], None]) -> None:
+    _progress_listeners.remove(fn)
+
+
+def _notify_progress(season_id: int, title: str, current: int, total: int) -> None:
+    for fn in _progress_listeners:
+        fn(season_id, title, current, total)
 
 
 def _parse_pub_time(pub_time_str: str) -> datetime | None:
@@ -194,6 +210,8 @@ class Pipeline:
 
         def _on_progress() -> None:
             pbar.update(1)
+            n = pbar.n
+            _notify_progress(self._season_id, self._anime_title, n, pbar.total)
 
         self._log("info", "开始采集 %d 集单集数据...", len(ep_ids))
         stats = await self._client.get_bangumi_ep_stats_batch(ep_ids, progress_callback=_on_progress)
@@ -244,6 +262,7 @@ class Pipeline:
         success = True
 
         self._season_id = season_id
+        self._anime_title = str(season_id)
 
         # 步骤1和步骤2没有数据依赖, 并发执行
         self._log("info", "[1/5] 获取动画信息... [2/5] 获取统计快照... (并发)")
@@ -433,7 +452,7 @@ class Pipeline:
 
         Sheet1 "动画统计": 动画基本信息 + 统计快照(单行)
         Sheet2 "正片数据": 每集数据(集号/BV号/各统计指标)
-        存储位置: data/archive/{日期}/{平台}/{标题}/原始数据.xlsx
+        存储位置: data/archive/{日期}/{平台}/{标题}.xlsx
         """
         if not self._raw_info and not self._raw_stat and not self._raw_episode_stats:
             return

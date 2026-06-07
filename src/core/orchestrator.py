@@ -6,13 +6,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import nullcontext
 
 from client.base import BaseClient
 from client.factory import ClientFactory
+from config import get_settings
 from core.pipeline import Pipeline
 from db.repository import Repository
 from db.session import get_session, init_db
+from db.worker import WorkerPool
 from models.anime import Anime
 
 logger = logging.getLogger(__name__)
@@ -93,52 +97,93 @@ class Orchestrator:
         return anime
 
     async def crawl_once(self, season_id: int, platform: str = "bilibili") -> bool:
-        """手动触发单个动画的完整采集"""
+        """手动触发单个动画的完整采集（使用主库）"""
+        async with ClientFactory.create(platform) as client:
+            return await self._crawl_with_client(season_id, platform, client)
+
+    async def _crawl_with_client(
+        self,
+        season_id: int,
+        platform: str,
+        client: BaseClient,
+        pool: WorkerPool | None = None,
+        worker_idx: int | None = None,
+    ) -> bool:
+        """使用给定 client 执行单动画采集
+
+        Args:
+            pool: WorkerPool, 设置后使用 worker DB 而非主库
+            worker_idx: pool 中的 slot 编号
+        """
         logger.info("")
         logger.info("=" * 60)
         logger.info("[%s] 开始采集 (platform=%s)", season_id, platform)
 
-        async with ClientFactory.create(platform) as client:
+        ctx = pool.get_session(worker_idx) if pool is not None and worker_idx is not None else nullcontext(get_session())  # type: ignore[assignment]
+        with ctx as session:
+            repo = Repository(session)
+            pipeline = Pipeline(repo, client)
+
+            error_msg = None
+            try:
+                success = await pipeline.crawl_once(season_id, platform)
+                if not success:
+                    error_msg = "采集过程中部分阶段返回失败"
+            except Exception as e:
+                error_msg = f"{type(e).__name__}: {e}"
+                logger.error("[%s] 采集中异常: %s", season_id, error_msg)
+                success = False
+
+            task = repo.get_crawl_task(season_id)
+            if task:
+                if success:
+                    repo.mark_task_success(task.id, task.interval_minutes)
+                    logger.info("[%s] 采集完成 (success)", season_id)
+                else:
+                    repo.mark_task_failed(task.id, error_msg or "未知错误")
+                    logger.warning("[%s] 采集完成 (failed: %s)", season_id, error_msg)
+
+            return success
+
+    async def crawl_all(self, season_ids: list[int] | None = None) -> None:
+        """手动触发全量采集（多 DB 并行写入, 零锁竞争）
+
+        Args:
+            season_ids: 要采集的动画 ID 列表，为 None 时从数据库读取
+        """
+        if season_ids is None:
             with get_session() as session:
                 repo = Repository(session)
-                pipeline = Pipeline(repo, client)
-
-                error_msg = None
-                try:
-                    success = await pipeline.crawl_once(season_id, platform)
-                    if not success:
-                        error_msg = "采集过程中部分阶段返回失败"
-                except Exception as e:
-                    error_msg = f"{type(e).__name__}: {e}"
-                    logger.error("[%s] 采集中异常: %s", season_id, error_msg)
-                    success = False
-
-                # 无论成功/失败, 都更新任务状态
-                task = repo.get_crawl_task(season_id)
-                if task:
-                    if success:
-                        repo.mark_task_success(task.id, task.interval_minutes)
-                        logger.info("[%s] 采集完成 (success)", season_id)
-                    else:
-                        repo.mark_task_failed(task.id, error_msg or "未知错误")
-                        logger.warning("[%s] 采集完成 (failed: %s)", season_id, error_msg)
-
-                return success
-
-    async def crawl_all(self) -> None:
-        """手动触发全量采集"""
-        with get_session() as session:
-            repo = Repository(session)
-            anime_list = repo.get_all_anime()
-            season_ids = [a.season_id for a in anime_list]
+                anime_list = repo.get_all_anime()
+                season_ids = [a.season_id for a in anime_list]
 
         if not season_ids:
             logger.info("没有跟踪中的动画, 请先用 add 命令添加")
             return
 
-        for sid in season_ids:
-            logger.info("[%s] 正在采集", sid)
-            try:
-                await self.crawl_once(sid)
-            except Exception as e:
-                logger.error("[%s] 采集失败: %s", sid, e)
+        settings = get_settings()
+        max_concurrent = settings.max_concurrent_anime
+
+        pool = WorkerPool(n_workers=max_concurrent, db_path=settings.db_path)
+        pool.setup()
+
+        logger.info("开始并发采集 %d 部动画 (并发数=%d, worker DB)", len(season_ids), max_concurrent)
+
+        async with ClientFactory.create("bilibili") as client:
+
+            async def _crawl_one(sid: int) -> None:
+                slot = await pool.acquire()
+                try:
+                    logger.info("[%s] 正在采集", sid)
+                    await self._crawl_with_client(sid, "bilibili", client, pool, slot)
+                except Exception as e:
+                    logger.error("[%s] 采集失败: %s", sid, e)
+                finally:
+                    pool.release(slot)
+
+            await asyncio.gather(*[_crawl_one(sid) for sid in season_ids])
+
+        logger.info("正在合并 worker DB 到主库...")
+        pool.merge()
+        pool.cleanup()
+        logger.info("全部采集完成")

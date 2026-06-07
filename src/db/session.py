@@ -8,33 +8,37 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from contextlib import contextmanager
+from functools import lru_cache
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from config import get_settings
 from models.base import Base
 
-_engine = None
-_SessionFactory = None
 
-
+@lru_cache(maxsize=1)
 def get_engine():
-    """获取全局数据库引擎单例"""
-    global _engine
-    if _engine is None:
-        settings = get_settings()
-        settings.db_path.parent.mkdir(parents=True, exist_ok=True)
-        _engine = create_engine(f"sqlite:///{settings.db_path}", echo=False, connect_args={"timeout": 30})
-    return _engine
+    """获取全局数据库引擎单例（缓存于函数对象，模块重载时自动重建）"""
+    settings = get_settings()
+    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+    engine = create_engine(f"sqlite:///{settings.db_path}", echo=False, connect_args={"timeout": 30})
+
+    @event.listens_for(engine, "connect")
+    def _set_wal(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+
+    return engine
 
 
+@lru_cache(maxsize=1)
 def get_session_factory() -> sessionmaker[Session]:
-    """获取全局会话工厂单例"""
-    global _SessionFactory
-    if _SessionFactory is None:
-        _SessionFactory = sessionmaker(bind=get_engine())
-    return _SessionFactory
+    """获取全局会话工厂单例（缓存于函数对象，模块重载时自动重建）"""
+    return sessionmaker(bind=get_engine())
 
 
 def init_db() -> None:

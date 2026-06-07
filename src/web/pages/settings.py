@@ -51,17 +51,10 @@ def render_settings() -> None:
         st.markdown("#### 网络配置")
         st.markdown("修改后需重启应用生效")
 
-        request_delay = st.number_input(
-            "请求延迟（秒）",
-            min_value=0.01,
-            max_value=10.0,
-            value=float(settings.request_delay),
-            step=0.05,
-        )
         max_concurrency = st.number_input(
-            "最大并发数",
+            "最大并发连接数",
             min_value=1,
-            max_value=50,
+            max_value=200,
             value=settings.max_concurrency,
         )
         max_retries = st.number_input(
@@ -76,7 +69,7 @@ def render_settings() -> None:
             type="password",
         )
 
-        st.info("修改默认值请通过环境变量 ANIME_REQUEST_DELAY / ANIME_MAX_CONCURRENCY / ANIME_MAX_RETRIES / ANIME_BILIBILI_COOKIE 设置，需重启应用生效")
+        st.info("修改默认值请通过环境变量 ANIME_MAX_CONCURRENCY / ANIME_MAX_RETRIES / ANIME_BILIBILI_COOKIE 设置，需重启应用生效")
 
     with tab_display:
         settings = get_settings()

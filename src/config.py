@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 from pydantic_settings import BaseSettings
@@ -23,10 +24,10 @@ class Settings(BaseSettings):
     tracking_dir: Path = _PROJECT_ROOT / "data" / "tracking"
 
     # === HTTP 客户端配置 ===
-    request_delay: float = 0.15
-    max_concurrency: int = 10
+    max_concurrency: int = 15
     max_connections: int = 20
     request_timeout: float = 15.0
+    max_concurrent_anime: int = 3
 
     # === 重试配置 ===
     max_retries: int = 3
@@ -48,15 +49,10 @@ class Settings(BaseSettings):
     # === B站配置(Cookie 从环境变量 ANIME_BILIBILI_COOKIE 读取) ===
     bilibili_cookie: str = ""
 
-    model_config = {"env_prefix": "ANIME_"}
+    model_config = {"env_prefix": "ANIME_", "env_file": ".env"}
 
 
-_settings: Settings | None = None
-
-
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """获取全局配置单例"""
-    global _settings
-    if _settings is None:
-        _settings = Settings()
-    return _settings
+    """获取全局配置单例（缓存于函数对象，模块重载时自动重建）"""
+    return Settings()

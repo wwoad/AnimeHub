@@ -39,6 +39,14 @@ def get_anime_list() -> pd.DataFrame:
         animes = session.query(Anime).filter(Anime.season_id.in_(season_ids)).all()
         anime_map = {a.season_id: a for a in animes}
 
+        ep_counts = (
+            session.query(Episode.anime_id, func.count(Episode.ep_id))
+            .filter(Episode.anime_id.in_(season_ids))
+            .group_by(Episode.anime_id)
+            .all()
+        )
+        ep_count_map = {anime_id: count for anime_id, count in ep_counts}
+
         subq = (
             session.query(
                 AnimeStat.anime_id,
@@ -63,10 +71,12 @@ def get_anime_list() -> pd.DataFrame:
                 {
                     "season_id": t.season_id,
                     "platform": t.platform,
+                    "media_id": int((a.extra or {}).get("media_id", 0)) if a else 0,
                     "title": a.title if a else (t.title or f"动画{t.season_id}"),
+                    "season_type": int(a.season_type) if a else 0,
                     "area": a.area if a else "",
                     "rating_score": float(a.rating_score) if (a and a.rating_score is not None) else 0.0,
-                    "total_episodes": int(a.total_episodes) if (a and a.total_episodes is not None) else 0,
+                    "total_episodes": max(int(a.total_episodes) if (a and a.total_episodes is not None) else 0, ep_count_map.get(t.season_id, 0)),
                     "is_finish": "完结" if (a and a.is_finish) else "连载中",
                     "views": s.views if s else 0,
                     "follow": s.follow if s else 0,
@@ -74,6 +84,7 @@ def get_anime_list() -> pd.DataFrame:
                     "likes": s.likes if s else 0,
                     "coins": s.coins if s else 0,
                     "favorite": s.favorite if s else 0,
+                    "share": s.share if s else 0,
                     "status": str({"pending": "待采集", "running": "采集中", "success": "成功", "failed": "失败"}.get(t.status or "pending", "待采集")),
                     "last_crawled": str(t.last_crawled_at.strftime("%m-%d %H:%M")) if t.last_crawled_at else "未采集",
                     "paused": t.paused if t.paused is not None else False,

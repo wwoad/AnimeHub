@@ -20,7 +20,27 @@ def _fmt(n: int) -> str:
     return f"{n:,}"
 
 
+def _fmt_label(n: float) -> str:
+    if n == 0:
+        return "0"
+    if n < 1:
+        return f"{n * 100:.1f}%"
+    if n >= 100_000_000:
+        return f"{n / 100_000_000:.2f}亿"
+    if n >= 10_000:
+        return f"{n / 10_000:.1f}万"
+    return f"{n:,.0f}"
+
+
 _METRIC_CN = {"views": "播放量", "follow": "追番", "danmaku": "弹幕", "likes": "点赞", "coins": "投币"}
+
+_BAR_COLOR = "#448AFF"
+
+_CHART_DARK = dict(
+    template="plotly_dark",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+)
 
 
 def render_briefing() -> None:
@@ -166,8 +186,17 @@ def _ranking(df: pd.DataFrame) -> None:
         }
     )
 
-    fig = px.bar(rank_data, x=_METRIC_CN[metric], y="标题", orientation="h", title=f"TOP {len(top)} {_METRIC_CN[metric]}排行")
-    fig.update_layout(yaxis={"categoryorder": "total ascending"})
+    rank_data = rank_data.iloc[::-1]
+    rank_data["_label"] = rank_data[_METRIC_CN[metric]].apply(_fmt_label)
+    max_val = rank_data[_METRIC_CN[metric]].max()
+    step = 500_000_000
+    tick_vals = [i * step for i in range(int(max_val / step) + 2)]
+    tick_texts = [f"{v // 100_000_000}亿" for v in tick_vals]
+    fig = px.bar(rank_data, x=_METRIC_CN[metric], y="标题", orientation="h", title=f"TOP {len(top)} {_METRIC_CN[metric]}排行", text=rank_data["_label"], labels={"标题": "动画标题"}, color_discrete_sequence=[_BAR_COLOR])
+    fig.update_layout(yaxis={"categoryorder": "trace"}, height=750, bargap=0.15, title_x=0.5, title_font=dict(size=14), margin=dict(t=45, b=10, l=10, r=30), **_CHART_DARK)
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="rgba(128,128,128,0.12)", zeroline=False, tickfont=dict(size=10), tickvals=tick_vals, ticktext=tick_texts)
+    fig.update_yaxes(showgrid=False, zeroline=False, tickfont=dict(size=10))
+    fig.update_traces(textposition="outside", textfont=dict(size=10), marker=dict(cornerradius=6, line=dict(width=1, color="rgba(100,180,255,0.25)")))
     st.plotly_chart(fig, width="stretch")
     st.dataframe(rank_data.astype(str), width="stretch", height=max(200, min(500, 40 + len(rank_data) * 35)), hide_index=True)
 
@@ -193,7 +222,7 @@ def _compare(df: pd.DataFrame) -> None:
     st.dataframe(compare_df.astype(str), width="stretch", hide_index=True)
 
     melt_df = compare_df.melt(id_vars=["标题"], value_vars=[_METRIC_CN[m] for m in metrics], var_name="指标", value_name="数值")
-    st.plotly_chart(px.bar(melt_df, x="指标", y="数值", color="标题", barmode="group", title="多动画指标对比"), width="stretch")
+    st.plotly_chart(px.bar(melt_df, x="指标", y="数值", color="标题", barmode="group", title="多动画指标对比", color_discrete_sequence=px.colors.qualitative.Dark24), width="stretch")
 
 
 def _trend(df: pd.DataFrame) -> None:
@@ -216,7 +245,8 @@ def _trend(df: pd.DataFrame) -> None:
         st.warning(f"数据中没有 {metric} 字段")
         return
 
-    fig = px.line(history_df, x="时间", y=metric, title=f"{titles[idx]} - {metric}趋势")
+    fig = px.line(history_df, x="时间", y=metric, title=f"{titles[idx]} - {metric}趋势", color_discrete_sequence=["#00E5FF"])
+    fig.update_layout(height=400, **_CHART_DARK)
     st.plotly_chart(fig, width="stretch")
     st.dataframe(history_df.astype(str), width="stretch", hide_index=True)
 

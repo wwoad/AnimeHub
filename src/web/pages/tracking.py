@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+import threading
+import time
+from collections import deque
+
 import streamlit as st
 
 from config import get_settings
@@ -52,6 +57,41 @@ _LOG_CSS = """
 """
 
 
+class StreamlitLogHandler(logging.Handler):
+    """将日志写入内存循环缓冲区，供 Streamlit 实时读取"""
+
+    def __init__(self, max_lines: int = 200) -> None:
+        super().__init__()
+        self.buffer: deque[str] = deque(maxlen=max_lines)
+        fmt = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        self.setFormatter(fmt)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.buffer.append(self.format(record))
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.buffer)
+
+
+class WebLogFilter(logging.Filter):
+    """只允许业务核心模块的日志进入 Web UI 面板，屏蔽库噪音"""
+
+    BLOCKED_PREFIXES = ("httpx", "httpcore", "urllib3", "urllib3.")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR:
+            return True
+        if record.name.startswith(self.BLOCKED_PREFIXES):
+            return False
+        if record.name in ("cli.crawling", "core.orchestrator", "core.pipeline", "web.pages.tracking"):
+            return True
+        return False
+
+
 def _read_recent_log(n: int = 80) -> str:
 
     log_path = get_settings().log_dir / "anime-hub.log"
@@ -68,17 +108,55 @@ def _read_recent_log(n: int = 80) -> str:
         return "读取日志失败"
 
 
+def _crawl_worker(season_id: int | None, handler: StreamlitLogHandler, tracker: dict[str, int]) -> None:
+    """在后台线程中执行爬取，日志写入 handler"""
+    from core.pipeline import add_progress_listener, remove_progress_listener
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    handler.addFilter(WebLogFilter())
+    root.addHandler(handler)
+
+    def _on_progress(season_id: int, title: str, current: int, total: int) -> None:
+        if current >= total and total > 0:
+            tracker.pop(season_id, None)
+        elif total > 0:
+            tracker[season_id] = {"title": title, "current": current, "total": total}
+
+    add_progress_listener(_on_progress)
+    try:
+        import argparse
+
+        from cli.crawling import cmd_crawl
+
+        logging.getLogger(__name__).info("爬取线程已启动")
+        args = argparse.Namespace(season_id=season_id)
+        cmd_crawl(args)
+    except Exception:
+        logger = logging.getLogger(__name__)
+        logger.exception("爬取线程异常")
+    finally:
+        remove_progress_listener(_on_progress)
+        root.removeHandler(handler)
+
+
 def _do_crawl(season_id: int | None = None) -> None:
-
-    import argparse
-
-    from cli.crawling import cmd_crawl
-
-    args = argparse.Namespace(season_id=season_id)
-
+    """启动后台爬取线程，不阻塞 Streamlit"""
     init_db()
-
-    cmd_crawl(args)
+    handler = StreamlitLogHandler()
+    tracker: dict[int, dict[str, object]] = {}
+    thread = threading.Thread(
+        target=_crawl_worker,
+        args=(season_id, handler, tracker),
+        daemon=True,
+    )
+    st.session_state["crawl_handler"] = handler
+    st.session_state["crawl_thread"] = thread
+    st.session_state["crawling"] = True
+    st.session_state["crawl_progress"] = tracker
+    thread.start()
 
 
 def _check_tracking_changes(edited, original_paused):
@@ -110,6 +188,21 @@ def _check_tracking_changes(edited, original_paused):
 
 
 def render_tracking() -> None:
+    st.markdown(
+        """
+<style>
+    /* ===== 爬取 / 更新列表 (Primary) Disabled ===== */
+    div[data-testid="stButton"] button[kind="primary"]:disabled {
+        color: #888 !important;
+    }
+    /* ===== 应用 (Secondary) Disabled ===== */
+    div[data-testid="stButton"] button[kind="secondary"]:disabled {
+        color: #555 !important;
+    }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
     try:
         tracking_header = st.container()
 
@@ -118,8 +211,9 @@ def render_tracking() -> None:
         _render_log_panel()
     except Exception:
         import traceback
+
         traceback.print_exc()
-        st.error(f"渲染追踪页面出错")
+        st.error("渲染追踪页面出错")
 
     st.markdown("---")
 
@@ -136,6 +230,8 @@ def render_tracking() -> None:
 
 def _render_crawl_header() -> None:
 
+    is_crawling = st.session_state.get("crawling", False)
+
     has_changes = st.session_state.get("tracking_has_changes", False)
 
     title_col, mode_col, crawl_col, apply_col = st.columns([5, 1, 1, 0.5])
@@ -149,48 +245,40 @@ def _render_crawl_header() -> None:
             ["批量爬取", "单个爬取"],
             label_visibility="collapsed",
             key="crawl_mode_sel",
+            disabled=is_crawling,
         )
 
     with crawl_col:
         if crawl_mode == "批量爬取":
-            if st.button("爬取", type="primary", use_container_width=True, key="crawl_all"):
-                st.session_state["crawling"] = True
-
-                with st.spinner("正在爬取所有动画..."):
-                    _do_crawl()
-
-                st.success("爬取完成!")
+            if st.button("爬取", type="primary", use_container_width=True, key="crawl_all", disabled=is_crawling):
+                _do_crawl()
 
                 st.rerun()
 
         else:
-            sid_col, btn_col = st.columns([1, 1])
+            sid_col, btn_col = st.columns([2, 1])
 
             with sid_col:
                 sid = st.text_input(
                     "动画编号",
-                    placeholder="输入动画编号",
+                    placeholder="单个编号",
                     label_visibility="collapsed",
                     key="crawl_sid",
+                    disabled=is_crawling,
                 )
 
             with btn_col:
-                if st.button("爬取", type="primary", use_container_width=True, key="crawl_single"):
+                if st.button("爬取", type="primary", use_container_width=True, key="crawl_single", disabled=is_crawling):
                     if sid and sid.isdigit():
-                        st.session_state["crawling"] = True
-
-                        with st.spinner(f"正在爬取动画编号={sid}..."):
-                            _do_crawl(int(sid))
-
-                        st.success("爬取完成!")
+                        _do_crawl(int(sid))
 
                         st.rerun()
 
                     else:
-                        st.warning("请有效的动画编号")
+                        st.warning("请输入有效的动画编号")
 
     with apply_col:
-        if st.button("应用", disabled=not has_changes, key="apply_btn"):
+        if st.button("应用", disabled=not has_changes or is_crawling, key="apply_btn"):
             st.session_state["tracking_apply"] = True
             st.rerun()
 
@@ -212,6 +300,11 @@ def _render_tracking_table() -> None:
         "total_episodes",
         "follow",
         "views",
+        "danmaku",
+        "likes",
+        "coins",
+        "favorite",
+        "share",
         "is_finish",
         "status",
         "last_crawled",
@@ -227,6 +320,11 @@ def _render_tracking_table() -> None:
         "total_episodes": "集数",
         "follow": "追番量",
         "views": "播放量",
+        "danmaku": "弹幕",
+        "likes": "点赞",
+        "coins": "投币",
+        "favorite": "收藏",
+        "share": "分享",
         "is_finish": "状态",
         "status": "采集状态",
         "last_crawled": "上次采集",
@@ -244,14 +342,14 @@ def _render_tracking_table() -> None:
 
     show["状态"] = show["状态"].astype(str).map(lambda x: _finish_emoji.get(x, x))
 
-    for col in ["播放量", "追番量", "收藏"]:
+    for col in ["播放量", "追番量", "弹幕", "点赞", "投币", "收藏", "分享"]:
         if col in show.columns:
             show[col] = show[col].fillna(0).astype("int64").apply(lambda x: f"{x:,}")
     if "评分" in show.columns:
         show["评分"] = show["评分"].fillna(0.0).apply(lambda x: f"{x:.1f}")
 
     for col in show.columns:
-        if col not in ("采集状态", "状态", "播放量", "追番量", "收藏", "评分", "暂停", "删除"):
+        if col not in ("采集状态", "状态", "播放量", "追番量", "弹幕", "点赞", "投币", "收藏", "分享", "评分", "暂停", "删除"):
             show[col] = show[col].astype(str)
 
     show["暂停"] = df["paused"].values
@@ -321,19 +419,84 @@ def _render_tracking_table() -> None:
             st.session_state["tracking_has_changes"] = False
 
 
-def _render_log_panel() -> None:
+def _clear_crawl_state() -> None:
+    for k in ("crawling", "crawl_completed", "crawl_handler", "crawl_thread", "crawl_progress", "crawl_dismiss_at"):
+        st.session_state.pop(k, None)
 
-    if not st.session_state.get("crawling", False):
+
+def _render_log_panel() -> None:
+    """爬取进度面板（纯静态快照，不产生任何自动 rerun）"""
+    crawling = st.session_state.get("crawling", False)
+    completed = st.session_state.get("crawl_completed", False)
+    if not crawling and not completed:
         return
 
     st.markdown(_LOG_CSS, unsafe_allow_html=True)
 
-    log_text = _read_recent_log(80)
+    # ========== 标题行 + ✕ 按钮 ==========
+    _, close_col = st.columns([30, 1])
+    with close_col:
+        if st.button("✕", key="close_log", help="关闭日志面板", type="secondary"):
+            _clear_crawl_state()
+            st.rerun()
 
+    # ========== 日志面板 ==========
+    handler: StreamlitLogHandler | None = st.session_state.get("crawl_handler")
+    log_text = handler.text if handler else _read_recent_log(80)
     st.markdown(f'<div class="log-panel">{log_text}</div>', unsafe_allow_html=True)
+
+    # ========== 多进度条（每个动画一行） ==========
+    thread: threading.Thread | None = st.session_state.get("crawl_thread")
+    progress_map: dict = st.session_state.get("crawl_progress", {})
+
+    if crawling and thread is not None and thread.is_alive():
+        status_label = "正在爬取..."
+        status_color = "#aaa"
+    else:
+        status_label = "爬取完成!"
+        status_color = "#0f0"
+
+    st.markdown(f'<div style="color:{status_color};font-size:14px;font-weight:600;margin-bottom:6px;">{status_label} ({len(progress_map)} 部)</div>', unsafe_allow_html=True)
+
+    if progress_map:
+        items = list(progress_map.items())
+        prog_cols = st.columns(len(items))
+        for col, (sid, prog) in zip(prog_cols, items):
+            title = prog.get("title", f"#{sid}")
+            cur = prog.get("current", 0)
+            tot = prog.get("total", 0)
+            pct = (cur / tot * 100) if tot > 0 else 0
+            with col:
+                st.markdown(
+                    f"""<div style="position:relative;height:28px;background:#1a1a2e;border:1px solid #333;border-radius:4px;overflow:hidden;">
+                        <div style="background:#FF9800;width:{pct}%;height:100%;border-radius:4px;transition:width .3s;"></div>
+                        <div style="position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;gap:4px;color:#fff;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 6px;text-shadow:0 1px 3px rgba(0,0,0,.8),0 0 2px rgba(0,0,0,.5);">
+                            <span style="overflow:hidden;text-overflow:ellipsis;">{title}</span>
+                            <span>{cur}/{tot}</span>
+                        </div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+    # ========== 状态转换 ==========
+    if crawling and thread is not None and not thread.is_alive():
+        st.session_state["crawling"] = False
+        st.session_state["crawl_completed"] = True
+        st.session_state["crawl_dismiss_at"] = time.time() + 5
+
+    if completed and time.time() > st.session_state.get("crawl_dismiss_at", 0):
+        _clear_crawl_state()
+        st.rerun()
+
+    # ========== 持续刷新（2秒间隔，直到面板关闭） ==========
+    if (crawling and thread is not None and thread.is_alive()) or completed:
+        time.sleep(2)
+        st.rerun()
 
 
 def _render_discover_header() -> None:
+
+    is_crawling = st.session_state.get("crawling", False)
 
     platform_name = st.session_state.get("platform", "bilibili")
 
@@ -347,7 +510,7 @@ def _render_discover_header() -> None:
         st.markdown(f"### {display_name} 动画表")
 
     with update_col:
-        if st.button("更新列表", key="refresh_discover", type="primary", use_container_width=True):
+        if st.button("更新列表", key="refresh_discover", type="primary", use_container_width=True, disabled=is_crawling):
             with st.spinner("正在从B站拉取..."):
                 import asyncio
 
@@ -360,7 +523,7 @@ def _render_discover_header() -> None:
             st.rerun()
 
     with add_col:
-        if st.button("应用", disabled=not has_selection, key="add_tracking"):
+        if st.button("应用", disabled=not has_selection or is_crawling, key="add_tracking"):
             st.session_state["discover_apply"] = True
             st.rerun()
 

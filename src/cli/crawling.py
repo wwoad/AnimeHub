@@ -10,35 +10,63 @@ from core.pipeline import Pipeline
 from core.scheduler import Scheduler
 from db.repository import Repository
 from db.session import get_session, init_db
+from db.worker import WorkerPool
 from models.crawl_task import CrawlTask
 
 logger = logging.getLogger(__name__)
 
 
 async def _crawl_all(targets: list[tuple[int, str, str, int, int]]) -> None:
-    """在单个事件循环内顺序采集所有目标(SQLite不支持并发写入)"""
+    """并发采集所有目标, 每个 slot 写入独立 worker DB 彻底消除锁竞争"""
     from client.factory import ClientFactory
+    from config import get_settings
+
+    settings = get_settings()
+    max_concurrent = settings.max_concurrent_anime
+
+    pool = WorkerPool(n_workers=max_concurrent, db_path=settings.db_path)
+    pool.setup()
 
     async with ClientFactory.create("bilibili") as client:
-        for season_id, platform, title, priority, interval_minutes in targets:
+
+        async def _crawl_one(season_id: int, platform: str, title: str, priority: int, interval_minutes: int) -> None:
             _ensure_task(season_id, platform, title, priority, interval_minutes)
+            slot = await pool.acquire()
             try:
-                success = await _crawl_single(client, season_id, platform)
+                success = await _crawl_single(client, season_id, platform, pool, slot)
                 if success:
                     logger.info("[%s-%s] 采集完成", season_id, title)
                 else:
                     logger.warning("[%s-%s] 采集部分失败", season_id, title)
             except Exception as e:
                 logger.error("[%s-%s] 采集失败: %s", season_id, title, e)
+            finally:
+                pool.release(slot)
+
+        await asyncio.gather(*[_crawl_one(*t) for t in targets])
+
+    pool.merge()
+    pool.cleanup()
 
 
-async def _crawl_single(client, season_id: int, platform: str) -> bool:
-    """在已有事件循环和客户端中采集单个动画"""
+async def _crawl_single(client, season_id: int, platform: str, pool: WorkerPool | None = None, worker_idx: int | None = None) -> bool:
+    """在已有事件循环和客户端中采集单个动画
+
+    Args:
+        pool: WorkerPool, 设置后使用 worker DB 而非主库
+        worker_idx: pool 中分配的 slot 编号
+    """
     logger.info("")
     logger.info("=" * 60)
     logger.info("[%s] 开始采集 (platform=%s)", season_id, platform)
 
-    with get_session() as session:
+    if pool is not None and worker_idx is not None:
+        ctx = pool.get_session(worker_idx)
+    else:
+        from contextlib import nullcontext
+        ctx = nullcontext(get_session())  # type: ignore[assignment]
+
+    with ctx as session:
         repo = Repository(session)
         pipeline = Pipeline(repo, client)
 

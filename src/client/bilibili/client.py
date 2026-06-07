@@ -1,9 +1,9 @@
 """Bilibili API 异步客户端
 
 基于 httpx.AsyncClient 实现的 B站数据采集客户端, 使用:
-- 令牌桶限速器控制请求频率
+- asyncio.Semaphore 控制并发连接数
 - tenacity 实现指数退避重试
-- asyncio.Semaphore 控制并发数
+- B站自身 429/412 响应作为唯一限速信号, 不设人工速率限制
 - Pydantic 模型验证 API 响应
 
 所有方法均为 async, 需在 async 上下文中调用。
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from typing import Any
 
 import httpx
@@ -44,35 +45,35 @@ _DEFAULT_HEADERS = {
 class BilibiliClient(BaseClient):
     """B站 API 异步客户端
 
+    不做人工速率限制, 仅用 Semaphore 控制同时连接数。
+    429/412 响应由 tenacity 自动退避处理。
+
     Args:
-        rate: 令牌桶速率(每秒请求数), 默认 2.5(即间隔0.4秒)
-        max_concurrency: 最大并发数, 默认 20
+        max_concurrency: 最大并发连接数, 默认 80
         headers: 自定义请求头(覆盖默认值)
     """
 
     def __init__(
         self,
-        rate: float | None = None,
         max_concurrency: int | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
         settings = get_settings()
-        self._rate = rate if rate is not None else (1.0 / settings.request_delay)
         self._max_concurrency = max_concurrency or settings.max_concurrency
         self._headers = {**_DEFAULT_HEADERS, **(headers or {})}
         if settings.bilibili_cookie:
             self._headers["Cookie"] = settings.bilibili_cookie
 
-        self._limiter = RateLimiter(rate=self._rate, burst=max(int(self._rate) + 2, self._max_concurrency))
         conns = settings.max_connections
 
+        self._limiter = RateLimiter(rate=10, burst=12)
         self._semaphore = asyncio.Semaphore(self._max_concurrency)
         self._client = httpx.AsyncClient(
             headers=self._headers,
             timeout=settings.request_timeout,
             limits=httpx.Limits(
                 max_connections=conns,
-                max_keepalive_connections=20,
+                max_keepalive_connections=min(50, conns),
             ),
         )
 
@@ -86,42 +87,46 @@ class BilibiliClient(BaseClient):
     async def __aexit__(self, *args: Any) -> None:
         await self.close()
 
+    async def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """获取 Semaphore 槽位 + 令牌后发起请求
+
+        Semaphore 在 retry 外部, 确保重试期间不占槽位。
+        """
+        await asyncio.sleep(random.uniform(0, 0.03))
+        await self._limiter.acquire()
+        async with self._semaphore:
+            return await self._request(url, params)
+
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=2, max=60),
         reraise=True,
     )
-    async def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """发送带限速和重试的 GET 请求
+    async def _request(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """实际 HTTP 请求, tenacity 重试在 Semaphore 外部"""
+        resp = await self._client.get(url, params=params)
 
-        每次请求前通过令牌桶获取许可, 429/412响应自动退避。
-        对412(WAF)增加额外等待时间。
-        """
-        async with self._semaphore:
-            await self._limiter.acquire()
-            resp = await self._client.get(url, params=params)
-
-            if resp.status_code == 412:
-                logger.warning("触发WAF(412), 等待30秒后重试: url=%s", url)
-                await asyncio.sleep(30)
-                resp.raise_for_status()
-
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", "10"))
-                logger.warning("限流(429), 等待%ds后重试: url=%s", retry_after, url)
-                await asyncio.sleep(retry_after)
-                resp.raise_for_status()
-
+        if resp.status_code == 412:
+            logger.warning("触发WAF(412), 等待30秒后重试: url=%s", url)
+            await asyncio.sleep(30)
             resp.raise_for_status()
-            data = resp.json()
-            if data.get("code") != 0:
-                logger.warning(
-                    "API错误: code=%s msg=%s url=%s",
-                    data.get("code"),
-                    data.get("message"),
-                    url,
-                )
-            return data
+
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", "10"))
+            logger.warning("限流(429), 等待%ds后重试: url=%s", retry_after, url)
+            await asyncio.sleep(retry_after)
+            resp.raise_for_status()
+
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            logger.warning(
+                "API错误: code=%s msg=%s url=%s",
+                data.get("code"),
+                data.get("message"),
+                url,
+            )
+        return data
 
     # ============================================================
     # 搜索 API
@@ -303,27 +308,38 @@ class BilibiliClient(BaseClient):
         self,
         ep_ids: list[int],
         progress_callback: Any | None = None,
+        batch_size: int | None = None,
     ) -> list[dict | None]:
-        """批量获取单集统计
+        """批量获取单集统计, 分批执行以保证多动画间的公平调度
 
         Args:
             ep_ids: 单集ID列表
             progress_callback: 每完成一个请求后调用的回调, 签名 callback()
+            batch_size: 每批并发请求数, 默认 max(10, max_concurrency // 3)
         """
-        results: list[dict | None] = [None] * len(ep_ids)
-        semaphore = asyncio.Semaphore(1)
+        if batch_size is None:
+            batch_size = max(8, self._max_concurrency // 5)
 
-        async def _fetch(index: int, ep_id: int) -> None:
-            try:
-                results[index] = await self.get_bangumi_ep_stat(ep_id)
-            except Exception as e:
-                logger.warning("获取 ep_id=%s 统计失败: %s", ep_id, e)
-            finally:
+        results: list[dict | None] = [None] * len(ep_ids)
+
+        for offset in range(0, len(ep_ids), batch_size):
+            batch = ep_ids[offset : offset + batch_size]
+            batch_results: list = await asyncio.gather(
+                *[self.get_bangumi_ep_stat(ep_id) for ep_id in batch],
+                return_exceptions=True,
+            )
+
+            for j, r in enumerate(batch_results):
+                idx = offset + j
+                if isinstance(r, Exception):
+                    logger.warning("获取 ep_id=%s 统计失败: %s", batch[j], r)
+                else:
+                    results[idx] = r
                 if progress_callback:
                     progress_callback()
 
-        tasks = [_fetch(i, ep_id) for i, ep_id in enumerate(ep_ids)]
-        await asyncio.gather(*tasks)
+            await asyncio.sleep(0.05)
+
         return results
 
     async def get_video_stats_batch(self, aids: list[int]) -> list[VideoStat | None]:

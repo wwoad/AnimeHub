@@ -17,11 +17,6 @@ dependencies = [
     "plotly>=6.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "watchfiles>=0.21",
-]
-
 [project.scripts]
 anime-hub = "main:main"
 
