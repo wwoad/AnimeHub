@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import nullcontext
 
 from client.base import BaseClient
 from client.factory import ClientFactory
@@ -119,7 +118,7 @@ class Orchestrator:
         logger.info("=" * 60)
         logger.info("[%s] 开始采集 (platform=%s)", season_id, platform)
 
-        ctx = pool.get_session(worker_idx) if pool is not None and worker_idx is not None else nullcontext(get_session())  # type: ignore[assignment]
+        ctx = pool.get_session(worker_idx) if pool is not None and worker_idx is not None else get_session()
         with ctx as session:
             repo = Repository(session)
             pipeline = Pipeline(repo, client)

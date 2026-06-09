@@ -63,13 +63,18 @@ def render_settings() -> None:
             max_value=10,
             value=settings.max_retries,
         )
-        bilibili_cookie = st.text_input(
-            "B站Cookie",
-            value=settings.bilibili_cookie or "",
+        bilibili_cookie_1 = st.text_input(
+            "B站Cookie 1",
+            value=settings.bilibili_cookie_1 or "",
+            type="password",
+        )
+        bilibili_cookie_2 = st.text_input(
+            "B站Cookie 2",
+            value=settings.bilibili_cookie_2 or "",
             type="password",
         )
 
-        st.info("修改默认值请通过环境变量 ANIME_MAX_CONCURRENCY / ANIME_MAX_RETRIES / ANIME_BILIBILI_COOKIE 设置，需重启应用生效")
+        st.info("修改默认值请通过环境变量 ANIME_BILIBILI_COOKIE_1 / ANIME_BILIBILI_COOKIE_2 设置，需重启应用生效")
 
     with tab_display:
         settings = get_settings()

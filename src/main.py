@@ -134,7 +134,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # — 发现 —
     p = sub.add_parser("discover", help="从B站拉取国创/番剧列表, 写入CSV")
-    p.add_argument("--type", type=int, default=4, help="分类类型(1=番剧, 4=国创)")
+    p.add_argument("--type", type=int, default=None, help="分类类型(1=番剧, 4=国创, 默认全部)")
     p.add_argument("--order", type=int, default=2, help="排序方式(2=追番数, 3=播放量, 5=评分)")
 
     # — Web UI —

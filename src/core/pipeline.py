@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
 from datetime import datetime
-
-import pandas as pd
+from typing import Any
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 from tqdm import tqdm
@@ -28,15 +26,18 @@ from models.episode_stat import EpisodeStat
 
 logger = logging.getLogger(__name__)
 
-_progress_listeners: list[Callable[[int, str, int, int], None]] = []
+_progress_listeners: list = []
 
 
-def add_progress_listener(fn: Callable[[int, str, int, int], None]) -> None:
-    _progress_listeners.append(fn)
+def add_progress_listener(callback) -> None:
+    _progress_listeners.append(callback)
 
 
-def remove_progress_listener(fn: Callable[[int, str, int, int], None]) -> None:
-    _progress_listeners.remove(fn)
+def remove_progress_listener(callback) -> None:
+    try:
+        _progress_listeners.remove(callback)
+    except ValueError:
+        pass
 
 
 def _notify_progress(season_id: int, title: str, current: int, total: int) -> None:
@@ -79,10 +80,11 @@ class Pipeline:
     每个方法对应一个采集阶段, 可被 Orchestrator 组合调用。
     """
 
-    def __init__(self, repo: Repository, client: BaseClient) -> None:
+    def __init__(self, repo: Repository, client: BaseClient, position: int | None = None) -> None:
         self._repo = repo
         self._client = client
         self._fast_mode = getattr(client, "_fast_mode", False)
+        self._position = position
         self._raw_info = None
         self._raw_stat = None
         self._raw_episode_stats: list[dict | None] | None = None
@@ -175,8 +177,20 @@ class Pipeline:
             self._log("error", "获取动画详情失败(集数同步)")
             return
 
-        episode_dicts = self._transform_episodes(info, platform)
+        episode_dicts = self._transform_all_episodes(info, platform)
         self._repo.sync_episodes(season_id, episode_dicts)
+
+        # 诊断日志: 打印各类型 episode 数量
+        type_counts = {"main": 0, "trailer": 0, "special": 0, "misc": 0}
+        for d in episode_dicts:
+            t = d.get("episode_type", "misc")
+            type_counts[t] = type_counts.get(t, 0) + 1
+        self._log(
+            "info",
+            "[3/5] 同步完成: main=%d trailer=%d special=%d misc=%d total=%d",
+            type_counts["main"], type_counts["trailer"], type_counts["special"],
+            type_counts["misc"], len(episode_dicts),
+        )
 
     async def fetch_and_save_episode_stats(self, season_id: int, platform: str = "bilibili") -> list[EpisodeStat]:
         """获取所有单集的统计数据并批量保存
@@ -203,15 +217,26 @@ class Pipeline:
 
         pbar = tqdm(
             total=len(ep_ids),
-            desc=f"{self._tag()} 正片数据",
+            desc=f"{self._tag()} 分集数据",
             unit="集",
             disable=not show_bar,
+            position=self._position,
+            leave=False,
         )
 
+        progress_count = 0
+        season_id_snapshot = self._season_id
+        title_snapshot = self._anime_title
+
         def _on_progress() -> None:
+            nonlocal progress_count
             pbar.update(1)
-            n = pbar.n
-            _notify_progress(self._season_id, self._anime_title, n, pbar.total)
+            progress_count += 1
+            for listener in _progress_listeners:
+                try:
+                    listener(season_id_snapshot, title_snapshot, progress_count, len(ep_ids))
+                except Exception:
+                    pass
 
         self._log("info", "开始采集 %d 集单集数据...", len(ep_ids))
         stats = await self._client.get_bangumi_ep_stats_batch(ep_ids, progress_callback=_on_progress)
@@ -262,7 +287,6 @@ class Pipeline:
         success = True
 
         self._season_id = season_id
-        self._anime_title = str(season_id)
 
         # 步骤1和步骤2没有数据依赖, 并发执行
         self._log("info", "[1/5] 获取动画信息... [2/5] 获取统计快照... (并发)")
@@ -275,6 +299,18 @@ class Pipeline:
             success = False
         else:
             self._log("info", "[1/5] OK")
+            if self._raw_info and self._raw_info.season_type not in (2,):
+                main_count = self._raw_info.total or sum(
+                    1 for ep in (self._raw_info.episodes or []) if ep.get("section_type", 0) == 0
+                )
+                if main_count == 0:
+                    self._log("warning", "[跳过] 正片集数为0 (未上映/已下架), 24小时后重试")
+                    saved_task = self._repo.get_crawl_task(season_id)
+                    if saved_task:
+                        saved_task.interval_minutes = 24 * 60
+                        saved_task.updated_at = datetime.now()
+                        self._repo._session.flush()
+                    return False
         if stat is None:
             self._log("warning", "[2/5] 跳过: 统计快照未获取")
             success = False
@@ -289,17 +325,68 @@ class Pipeline:
         episode_stats = await self.fetch_and_save_episode_stats(season_id, platform)
         self._log("info", "[4/5] OK: %d 集", len(episode_stats) if episode_stats else 0)
 
-        if episode_stats and stat:
-            total_favorite = sum(es.favorite for es in episode_stats)
-            if total_favorite > 0:
-                if self._raw_stat is not None:
-                    self._raw_stat.favorite = total_favorite
-                stat.favorite = total_favorite
-                self._repo._session.flush()
-                self._log("info", "[收藏累加] 总收藏: %d", total_favorite)
+        if episode_stats and stat and self._raw_info:
+            main_ep_ids = {
+                (ep.get("id") if ep.get("id") is not None else ep.get("ep_id"))
+                for ep in self._raw_info.episodes
+                if ep.get("section_type", 0) == 0
+            }
+
+            all_ep_ids = {
+                (ep.get("id") if ep.get("id") is not None else ep.get("ep_id"))
+                for ep in self._raw_info.episodes
+            }
+            for section in self._raw_info.sections:
+                for ep in section.get("episodes", []):
+                    eid = ep.get("id") if ep.get("id") is not None else ep.get("ep_id")
+                    if eid:
+                        all_ep_ids.add(eid)
+
+            ep_stat_map = {es.episode_id: es for es in episode_stats}
+
+            all_stats = [
+                stat for eid, stat in ep_stat_map.items()
+                if eid in all_ep_ids
+            ]
+            main_stats = [
+                stat for eid, stat in ep_stat_map.items()
+                if eid in main_ep_ids
+            ]
+
+            try:
+                if all_stats:
+                    updated = False
+
+                    # ORM 与 API 字段名映射: share→shares
+                    _raw_field = {"share": "shares"}
+
+                    for f in ("reply", "favorite"):
+                        total = sum(getattr(es, f, 0) for es in all_stats)
+                        api_val = getattr(stat, f, 0)
+                        if total > api_val:
+                            setattr(stat, f, total)
+                            if self._raw_stat is not None:
+                                setattr(self._raw_stat, _raw_field.get(f, f), total)
+                            updated = True
+
+                    for f in ("views", "danmaku", "likes", "coins", "share"):
+                        main_total = sum(getattr(es, f, 0) for es in main_stats) if main_stats else 0
+                        api_val = getattr(stat, f, 0)
+                        if main_total > api_val:
+                            setattr(stat, f, main_total)
+                            if self._raw_stat is not None:
+                                setattr(self._raw_stat, _raw_field.get(f, f), main_total)
+                            updated = True
+
+                    if updated:
+                        self._repo._session.flush()
+                        self._log("info", "[分集累加] 全量reply/favorite + 主集max修正 完成")
+            except Exception as e:
+                self._log("warning", "[分集累加] 跳过: %s", e)
 
         self._log("info", "[5/5] 保存原始数据...")
-        self._save_raw_excel(season_id, platform)
+        if not self._save_raw_excel(season_id, platform):
+            success = False
 
         return success
 
@@ -386,14 +473,14 @@ class Pipeline:
     }
 
     def _build_anime_sheet_rows(self, season_id: int, platform: str = "bilibili") -> list[dict]:
-        """构建动画统计Sheet数据"""
+        """构建动画级总数据行"""
         info = self._raw_info
         stat = self._raw_stat
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         row: dict[str, Any] = {
-            "动画ID": info.season_id if info else season_id,
-            "动画名": info.title if info else "",
+            "SID": info.season_id if info else season_id,
+            "动画标题": info.title if info else "",
             "地区": info.area if info else "",
             "评分": info.rating_score if info else 0,
             "评分人数": info.rating_count if info else 0,
@@ -402,6 +489,7 @@ class Pipeline:
             "追番数": stat.follow if stat else 0,
             "播放量": stat.views if stat else 0,
             "弹幕": stat.danmaku if stat else 0,
+            "评论": getattr(stat, "reply", 0) if stat else 0,
             "点赞": stat.likes if stat else 0,
             "投币": stat.coins if stat else 0,
             "收藏": stat.favorite if stat else 0,
@@ -410,13 +498,15 @@ class Pipeline:
         }
         return [row]
 
-    def _build_ep_sheet_rows(self, season_id: int, platform: str = "bilibili") -> list[dict]:
-        """构建正片数据Sheet数据(仅正片，仅集号/BV号/统计数据)"""
+    def _build_ep_sheet_rows(self, season_id: int, platform: str = "bilibili"):
+        """构建分集数据与分段汇总, 返回 (main_rows, trailer_row, special_row, misc_row)
+
+        优先从 info.episodes 获取正片(保留顺序),
+        非正片从 API 和 DB 双源汇总, DB 作为兜底确保无遗漏。
+        """
         info = self._raw_info
         if not info:
-            return []
-
-        ep_list = list(info.episodes) if info.episodes else []
+            return [], None, None, None
 
         stat_map: dict[int, dict] = {}
         if self._raw_episode_stats and self._raw_ep_ids:
@@ -424,80 +514,291 @@ class Pipeline:
                 if stat is not None:
                     stat_map[ep_id] = stat
 
-        rows: list[dict] = []
-        for ep_data in ep_list:
-            if ep_data.get("section_type", 0) != 0:
+        def _fmt_ts(ep_data):
+            ts = ep_data.get("pub_time")
+            if not ts:
+                return ""
+            try:
+                return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
+            except (ValueError, TypeError, OSError):
+                return ""
+
+        def _make_ep_row(ep_data, es, db_extra=None):
+            row = {
+                "集号": str(ep_data.get("title", "")),
+                "标题": ep_data.get("long_title", "") or ep_data.get("show_title", ""),
+                "BV号": ep_data.get("bvid", ""),
+                "发布时间": _fmt_ts(ep_data),
+                "时长(分)": round((ep_data.get("duration", 0) or 0) / 60000, 1) if isinstance(ep_data.get("duration", 0), (int, float)) else 0,
+                "备注": ep_data.get("badge", "") or "限免",
+                "播放量": es.get("view", 0),
+                "弹幕": es.get("dm", 0),
+                "评论": es.get("reply", 0),
+                "点赞": es.get("like", 0),
+                "投币": es.get("coin", 0),
+                "收藏": es.get("favorite", 0),
+                "分享": es.get("share", 0),
+            }
+            if db_extra and not row["BV号"]:
+                row["BV号"] = db_extra.get("bvid", "")
+            if db_extra and row["备注"] == "限免":
+                row["备注"] = db_extra.get("badge", "") or "限免"
+            return row
+
+        section_meta: dict[str, dict] = {
+            "trailer": {"count": 0, "duration_sum": 0},
+            "special": {"count": 0, "duration_sum": 0},
+            "misc": {"count": 0, "duration_sum": 0},
+        }
+        section_stats: dict[str, dict[str, int]] = {
+            "trailer": {},
+            "special": {},
+            "misc": {},
+        }
+
+        total_stats: dict[str, int] = {}
+
+        def _acc_total(es):
+            for k in ("view", "dm", "reply", "like", "coin", "favorite", "share"):
+                total_stats[k] = total_stats.get(k, 0) + es.get(k, 0)
+
+        def _acc_sec(ep_type, ep_data, es):
+            meta = section_meta[ep_type]
+            meta["count"] += 1
+            meta["duration_sum"] += ep_data.get("duration", 0) or 0
+            sums = section_stats[ep_type]
+            for k in ("view", "dm", "reply", "like", "coin", "favorite", "share"):
+                sums[k] = sums.get(k, 0) + es.get(k, 0)
+
+        # API 数据查找表 (优先 episodes, 其次 section episodes)
+        api_eps: dict[int, dict] = {}
+        for ep_data in (info.episodes or []):
+            ep_id = ep_data.get("id") if ep_data.get("id") is not None else ep_data.get("ep_id")
+            if ep_id:
+                api_eps.setdefault(ep_id, ep_data)
+        for section in (info.sections or []):
+            for ep_data in section.get("episodes", []):
+                ep_id = ep_data.get("id") if ep_data.get("id") is not None else ep_data.get("ep_id")
+                if ep_id:
+                    api_eps.setdefault(ep_id, ep_data)
+
+        # Section 查找表 (用于分类)
+        section_map: dict[int, dict] = {}
+        for section in (info.sections or []):
+            sid = section.get("id")
+            if sid:
+                section_map[sid] = section
+
+        # DB 查找表 (兜底元数据)
+        db_episodes = self._repo.get_episodes(season_id)
+        db_ep_map: dict[int, dict] = {}
+        for db_ep in db_episodes:
+            db_ep_map[db_ep.ep_id] = db_ep.extra or {}
+
+        main_rows: list[dict] = []
+        processed_ids: set[int] = set()
+
+        # 第一遍: info.episodes (保留正片顺序)
+        for ep_data in (info.episodes or []):
+            ep_id = ep_data.get("id") if ep_data.get("id") is not None else ep_data.get("ep_id")
+            if not ep_id or ep_id in processed_ids:
                 continue
-            ep_id = ep_data.get("id") or ep_data.get("ep_id")
-            es = stat_map.get(ep_id, {}) if ep_id else {}
-            rows.append(
-                {
-                    "集号": str(ep_data.get("title", "")),
-                    "标题": ep_data.get("long_title", "") or ep_data.get("show_title", ""),
-                    "BV号": ep_data.get("bvid", ""),
-                    "时长(分)": round((ep_data.get("duration", 0) or 0) / 60000, 1) if isinstance(ep_data.get("duration", 0), (int, float)) else 0,
-                    "播放量": es.get("view", 0),
-                    "弹幕": es.get("dm", 0),
-                    "评论": es.get("reply", 0),
-                    "收藏": es.get("favorite", 0),
-                    "点赞": es.get("like", 0),
-                    "投币": es.get("coin", 0),
-                    "分享": es.get("share", 0),
-                }
-            )
-        return rows
+            processed_ids.add(ep_id)
+            es = stat_map.get(ep_id, {})
+            db_extra = db_ep_map.get(ep_id)
 
-    def _save_raw_excel(self, season_id: int, platform: str = "bilibili") -> None:
-        """将本次采集数据保存为双Sheet Excel
+            if ep_data.get("section_type", 0) == 0:
+                main_rows.append(_make_ep_row(ep_data, es, db_extra))
+                _acc_total(es)
+            else:
+                section_id = ep_data.get("section_id", 0)
+                section = section_map.get(section_id, {})
+                ep_type = Pipeline._classify_episode_type(section) if section else "misc"
+                _acc_sec(ep_type, ep_data, es)
+                _acc_total(es)
 
-        Sheet1 "动画统计": 动画基本信息 + 统计快照(单行)
-        Sheet2 "正片数据": 每集数据(集号/BV号/各统计指标)
-        存储位置: data/archive/{日期}/{平台}/{标题}.xlsx
+        # 第二遍: section episodes (B站 section 接口返回的)
+        for section in (info.sections or []):
+            ep_type = Pipeline._classify_episode_type(section)
+            for ep_data in section.get("episodes", []):
+                ep_id = ep_data.get("id") if ep_data.get("id") is not None else ep_data.get("ep_id")
+                if not ep_id or ep_id in processed_ids:
+                    continue
+                processed_ids.add(ep_id)
+                es = stat_map.get(ep_id, {})
+                _acc_sec(ep_type, ep_data, es)
+                _acc_total(es)
+
+        # 第三遍: DB 兜底 —— 仍未被覆盖的 episode
+        for db_ep in db_episodes:
+            if db_ep.ep_id in processed_ids:
+                continue
+            processed_ids.add(db_ep.ep_id)
+            es = stat_map.get(db_ep.ep_id, {})
+            ep_data = api_eps.get(db_ep.ep_id, {})
+            db_extra = db_ep.extra or {}
+            dur = ep_data.get("duration", 0) or db_ep.duration_ms
+
+            if db_ep.episode_type == "main":
+                if not ep_data:
+                    ep_data = {
+                        "title": db_ep.title,
+                        "long_title": db_ep.long_title,
+                        "duration": db_ep.duration_ms,
+                    }
+                if not ep_data.get("bvid"):
+                    ep_data["bvid"] = db_extra.get("bvid", "")
+                if not ep_data.get("badge"):
+                    ep_data["badge"] = db_extra.get("badge", "")
+                main_rows.append(_make_ep_row(ep_data, es, db_extra))
+                _acc_total(es)
+            else:
+                _acc_sec(db_ep.episode_type, {"duration": dur}, es)
+                _acc_total(es)
+
+        def _build_summary(ep_type, label):
+            meta = section_meta[ep_type]
+            sums = section_stats[ep_type]
+            if meta["count"] == 0:
+                return None
+            total_dur = round(meta["duration_sum"] / 60000, 1)
+            avg_dur = round(total_dur / meta["count"], 1)
+            return {
+                "分类": label,
+                "视频数": meta["count"],
+                "总时长(分)": total_dur,
+                "平均时长(分)": avg_dur,
+                "播放量": sums.get("view", 0),
+                "弹幕": sums.get("dm", 0),
+                "评论": sums.get("reply", 0),
+                "点赞": sums.get("like", 0),
+                "投币": sums.get("coin", 0),
+                "收藏": sums.get("favorite", 0),
+                "分享": sums.get("share", 0),
+            }
+
+        return (
+            main_rows,
+            _build_summary("trailer", "预告汇总"),
+            _build_summary("special", "花絮汇总"),
+            _build_summary("misc", "杂项汇总"),
+            total_stats,
+        )
+
+    def _save_raw_excel(self, season_id: int, platform: str = "bilibili") -> bool:
+        """按五段式布局保存单 Sheet Excel, 返回是否保存成功
+
+        [总数据] → 空2行 → [分集数据] → 空2行 → [预告] → [花絮] → [杂项]
+        所有单元格右对齐, 采集时间仅动画级行保留。
         """
         if not self._raw_info and not self._raw_stat and not self._raw_episode_stats:
-            return
+            return False
 
         title_slug = sanitize_title(self._raw_info.title) if self._raw_info else str(season_id)
         raw_path = get_raw_path(title_slug, platform)
         ensure_dir(raw_path.parent)
 
         anime_rows = self._build_anime_sheet_rows(season_id, platform)
-        ep_rows = self._build_ep_sheet_rows(season_id, platform)
+        main_ep_rows, trailer_row, special_row, misc_row, total_stats = self._build_ep_sheet_rows(season_id, platform)
 
-        if not anime_rows and not ep_rows:
-            return
+        if total_stats and anime_rows:
+            anime_rows[0]["评论"] = total_stats.get("reply", 0)
+            anime_rows[0]["收藏"] = total_stats.get("favorite", 0)
+            anime_rows[0]["分享"] = total_stats.get("share", 0)
+
+        if not anime_rows and not main_ep_rows:
+            return False
 
         try:
-            with pd.ExcelWriter(str(raw_path), engine="openpyxl") as writer:
-                if anime_rows:
-                    df_anime = pd.DataFrame(anime_rows)
-                    df_anime.to_excel(writer, sheet_name="动画统计", index=False)
-                if ep_rows:
-                    df_ep = pd.DataFrame(ep_rows)
-                    df_ep.to_excel(writer, sheet_name="正片数据", index=False)
+            from openpyxl import Workbook
 
-                for ws in writer.sheets.values():
-                    for cell in ws[1]:
-                        cell.font = Font(name="宋体", size=16, bold=True, color="4BACC6")
-                        cell.alignment = Alignment(horizontal="center", vertical="center")
-                    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-                        for cell in row:
-                            cell.font = Font(name="宋体", size=16)
-                            cell.alignment = Alignment(vertical="center")
-                            if isinstance(cell.value, int):
-                                cell.number_format = "#,##0"
-                    for col_cells in ws.columns:
-                        col_letter = get_column_letter(col_cells[0].column)
-                        max_w = 0
-                        for cell in col_cells:
-                            val = str(cell.value or "")
-                            w = sum(2.2 if ord(c) > 127 else 1.1 for c in val) + 3
-                            if w > max_w:
-                                max_w = w
-                        ws.column_dimensions[col_letter].width = max_w * 1.5
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "动画统计"
+
+            font = Font(name="宋体", size=16)
+            ralign = Alignment(horizontal="right", vertical="center")
+
+            def _write_cell(r, c, value):
+                cell = ws.cell(row=r, column=c, value=value)
+                cell.font = font
+                cell.alignment = ralign
+                if isinstance(value, int):
+                    cell.number_format = "#,##0"
+                return cell
+
+            row = 1
+
+            # ================================================
+            # 段1: 动画级总数据
+            # ================================================
+            if anime_rows:
+                anime_data = anime_rows[0]
+                anime_keys = list(anime_data.keys())
+                for col, key in enumerate(anime_keys, 1):
+                    _write_cell(row, col, key)
+                row += 1
+                for col, key in enumerate(anime_keys, 1):
+                    _write_cell(row, col, anime_data[key])
+                row += 1
+
+            row += 2
+
+            # ================================================
+            # 段2: 分集数据
+            #   独有列(col 1-6) + 空2列(col 7-8) → 播放量对齐顶部表头 col 9
+            #   播放量~分享不再写表头, 由顶部表头统一覆盖
+            # ================================================
+            ep_unique_keys = ["集号", "标题", "BV号", "发布时间", "时长(分)", "备注"]
+            ep_stat_keys = ["播放量", "弹幕", "评论", "点赞", "投币", "收藏", "分享"]
+            if main_ep_rows:
+                for col, key in enumerate(ep_unique_keys, 1):
+                    _write_cell(row, col, key)
+                row += 1
+                for ep_row in main_ep_rows:
+                    for col, key in enumerate(ep_unique_keys, 1):
+                        _write_cell(row, col, ep_row.get(key, ""))
+                    for col, key in enumerate(ep_stat_keys, 9):
+                        _write_cell(row, col, ep_row.get(key, ""))
+                    row += 1
+
+            row += 2
+
+            # ================================================
+            # 段3-5: 汇总行
+            #   独有列(col 1-4) + 空4列(col 5-8) → 播放量对齐顶部表头 col 9
+            # ================================================
+            summary_unique_keys = ["分类", "视频数", "总时长(分)", "平均时长(分)"]
+            summary_stat_keys = ["播放量", "弹幕", "评论", "点赞", "投币", "收藏", "分享"]
+            summary_rows = [r for r in [trailer_row, special_row, misc_row] if r is not None]
+            if summary_rows:
+                for col, key in enumerate(summary_unique_keys, 1):
+                    _write_cell(row, col, key)
+                row += 1
+            for srow in summary_rows:
+                for col, key in enumerate(summary_unique_keys, 1):
+                    _write_cell(row, col, srow.get(key, ""))
+                for col, key in enumerate(summary_stat_keys, 9):
+                    _write_cell(row, col, srow.get(key, ""))
+                row += 1
+
+            # 自适应列宽
+            for col_cells in ws.columns:
+                col_letter = get_column_letter(col_cells[0].column)
+                max_w = 0
+                for cell in col_cells:
+                    val = str(cell.value or "")
+                    w = sum(2.2 if ord(c) > 127 else 1.1 for c in val) + 3
+                    if w > max_w:
+                        max_w = w
+                ws.column_dimensions[col_letter].width = min(max_w * 1.5, 60)
+
+            wb.save(str(raw_path))
             self._log("info", "原始数据已保存: %s", raw_path)
+            return True
         except Exception as e:
-            self._log("warning", "保存原始数据失败: %s", e)
+            self._log("error", "保存原始数据失败: %s", e)
+            return False
 
     # ============================================================
     # 数据转换方法 - 按平台分发
@@ -518,7 +819,7 @@ class Pipeline:
             "rating_score": info.rating_score,
             "rating_count": info.rating_count,
             "is_finish": info.is_finish,
-            "total_episodes": info.total if info.total else sum(1 for ep in (info.episodes or []) if ep.get("section_type", 0) == 0),
+            "total_episodes": info.total if info.total and info.total > 0 else sum(1 for ep in (info.episodes or []) if ep.get("section_type", 0) == 0),
             "pub_time": _parse_pub_time(info.pub_time),
             "subtitle": info.subtitle,
             "season_type": getattr(info, "season_type", 0),
@@ -539,6 +840,18 @@ class Pipeline:
         return core
 
     @staticmethod
+    def _classify_episode_type(section: dict) -> str:
+        """根据 section 的 type 和 title 判断类型
+        返回: "trailer" | "special" | "misc"
+        """
+        title = str(section.get("title", ""))
+        if section.get("type") == 1 or any(k in title for k in ("预告", "PV", "CM", "宣传", "先导", "倒计时", "角色来电", "角色PV")):
+            return "trailer"
+        if any(k in title for k in ("花絮", "幕后", "制作", "动捕", "设计", "建模", "配音")):
+            return "special"
+        return "misc"
+
+    @staticmethod
     def _transform_season_stat(season_id: int, stat, platform: str = "bilibili") -> AnimeStat:
         """将平台统计对象转换为 AnimeStat ORM 对象"""
         stat_kwargs = {
@@ -549,6 +862,7 @@ class Pipeline:
             "likes": getattr(stat, "likes", 0),
             "coins": getattr(stat, "coins", 0),
             "share": getattr(stat, "shares", 0),
+            "reply": getattr(stat, "reply", 0),
             "favorite": getattr(stat, "favorite", 0),
             "captured_at": datetime.now(),
         }
@@ -556,22 +870,18 @@ class Pipeline:
         return AnimeStat(**stat_kwargs)
 
     @staticmethod
-    def _transform_episodes(info, platform: str = "bilibili") -> list[dict]:
+    def _transform_all_episodes(info, platform: str = "bilibili") -> list[dict]:
         """将集数数据转换为 Episode ORM 字典列表
-        ,
-                只保留正片(info.episodes)，跳过花絮/特别篇等 sections。
-                通用字段放顶层, 平台专有ID放 extra。
+
+        处理 info.episodes(正片) 和 info.sections(花絮/预告/杂项)。
+        使用 _classify_episode_type 对 section 分类。
+        输出顺序: main → special → trailer → misc。
         """
-        episode_dicts: list[dict] = []
 
-        for ep_data in info.episodes:
-            if ep_data.get("section_type", 0) != 0:
-                continue
-
-            ep_id = ep_data.get("id") or ep_data.get("ep_id")
+        def _build_ep(ep_data, ep_type, section_id=0, section_title=""):
+            ep_id = ep_data.get("id") if ep_data.get("id") is not None else ep_data.get("ep_id")
             if not ep_id:
-                continue
-
+                return None
             core = {
                 "ep_id": ep_id,
                 "anime_id": info.season_id,
@@ -579,18 +889,70 @@ class Pipeline:
                 "long_title": ep_data.get("long_title", ""),
                 "duration_ms": ep_data.get("duration", 0) if isinstance(ep_data.get("duration"), (int, float)) else 0,
                 "pub_time": _parse_timestamp(ep_data.get("pub_time")),
+                "episode_type": ep_type,
             }
-
             if platform == "bilibili":
                 core["extra"] = {
                     "aid": ep_data.get("aid", 0),
                     "bvid": ep_data.get("bvid", ""),
                     "cid": ep_data.get("cid", 0),
-                    "badge": ep_data.get("badge", ""),
+                    "badge": ep_data.get("badge", "") or "限免",
                     "section_type": ep_data.get("section_type", 0),
-                    "section_id": ep_data.get("section_id", 0),
+                    "section_id": section_id,
+                    "section_title": section_title,
                 }
+            return core
 
-            episode_dicts.append(core)
+        seen_ids: set[int] = set()
+        main_eps: list[dict] = []
+        special_eps: list[dict] = []
+        trailer_eps: list[dict] = []
+        misc_eps: list[dict] = []
 
-        return episode_dicts
+        for ep_data in (info.episodes or []):
+            ep_id = ep_data.get("id") if ep_data.get("id") is not None else ep_data.get("ep_id")
+            if not ep_id or ep_id in seen_ids:
+                continue
+            seen_ids.add(ep_id)
+            section_id = ep_data.get("section_id", 0)
+
+            if ep_data.get("section_type", 0) == 0:
+                section_title = ""
+                for section in (info.sections or []):
+                    if section.get("id") == section_id and section_id > 0:
+                        section_title = section.get("title", "")
+                        break
+                ep = _build_ep(ep_data, "main", section_id, section_title)
+                if ep:
+                    main_eps.append(ep)
+            else:
+                section = None
+                if section_id > 0:
+                    for s in (info.sections or []):
+                        if s.get("id") == section_id:
+                            section = s
+                            break
+                ep_type = Pipeline._classify_episode_type(section) if section else "misc"
+                section_title = section.get("title", "") if section else ""
+                ep = _build_ep(ep_data, ep_type, section_id, section_title)
+                target_list = {"special": special_eps, "trailer": trailer_eps}.get(ep_type, misc_eps)
+                if ep:
+                    target_list.append(ep)
+
+        for section in (info.sections or []):
+            ep_type = Pipeline._classify_episode_type(section)
+            section_id = section.get("id", 0)
+            section_title = section.get("title", "")
+            target_list = {"special": special_eps, "trailer": trailer_eps}.get(ep_type, misc_eps)
+            for ep_data in section.get("episodes", []):
+                ep_id = ep_data.get("id") if ep_data.get("id") is not None else ep_data.get("ep_id")
+                if not ep_id or ep_id in seen_ids:
+                    continue
+                seen_ids.add(ep_id)
+                ep = _build_ep(ep_data, ep_type, section_id, section_title)
+                if ep:
+                    target_list.append(ep)
+
+        return main_eps + special_eps + trailer_eps + misc_eps
+
+    # ============================================================

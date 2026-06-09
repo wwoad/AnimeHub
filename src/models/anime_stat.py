@@ -25,9 +25,11 @@ class AnimeStat(Base):
     likes: Mapped[int] = mapped_column(Integer, default=0, comment="点赞数")
     coins: Mapped[int] = mapped_column(Integer, default=0, comment="投币数")
     share: Mapped[int] = mapped_column(Integer, default=0, comment="分享数")
+    reply: Mapped[int] = mapped_column(BigInteger, default=0, comment="总评论数（从分集累加）")
     favorite: Mapped[int] = mapped_column(Integer, default=0, comment="收藏数")
     extra: Mapped[dict | None] = mapped_column(JSON, default=dict, comment="平台专有数据")
     captured_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True, comment="采集时间")
 
     def __repr__(self) -> str:
         return f"<AnimeStat anime_id={self.anime_id} captured_at={self.captured_at}>"
+

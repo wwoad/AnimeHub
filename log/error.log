@@ -1,0 +1,77 @@
+$ anime-hub web
+启动 Web UI: http://localhost:8501
+2026-06-09 21:43:39.559 Uvicorn server started on 0.0.0.0:8501
+
+  You can now view your Streamlit app in your browser.
+
+  Local URL: http://localhost:8501
+  Network URL: http://192.168.31.5:8501
+  External URL: http://115.200.24.216:8501
+
+Traceback (most recent call last):
+  File "F:\AnimeHub\src\web\app.py", line 71, in <module>
+    render_tracking()
+  File "F:\AnimeHub\src\web\pages\tracking.py", line 231, in render_tracking
+    _render_discover_content()
+  File "F:\AnimeHub\src\web\pages\tracking.py", line 567, in _render_discover_content
+    disc_df = load_discover_csv()
+              ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\site-packages\streamlit\runtime\caching\cache_utils.py", line 280, in __call__
+    return self._get_or_create_cached_value(args, kwargs, spinner_message)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\site-packages\streamlit\runtime\caching\cache_utils.py", line 325, in _get_or_create_cached_value
+    return self._handle_cache_miss(cache, value_key, func_args, func_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\site-packages\streamlit\runtime\caching\cache_utils.py", line 384, in _handle_cache_miss
+    computed_value = self._info.func(*func_args, **func_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\AnimeHub\src\web\queries.py", line 196, in load_discover_csv
+    csv_path = get_settings().catalog_dir / "bilibili.csv"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\site-packages\pydantic\main.py", line 1042, in __getattr__
+    raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+AttributeError: 'Settings' object has no attribute 'catalog_dir'
+Traceback (most recent call last):
+  File "F:\AnimeHub\src\web\app.py", line 71, in <module>
+    render_tracking()
+  File "F:\AnimeHub\src\web\pages\tracking.py", line 231, in render_tracking
+    _render_discover_content()
+  File "F:\AnimeHub\src\web\pages\tracking.py", line 567, in _render_discover_content
+    disc_df = load_discover_csv()
+              ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\site-packages\streamlit\runtime\caching\cache_utils.py", line 280, in __call__
+    return self._get_or_create_cached_value(args, kwargs, spinner_message)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\site-packages\streamlit\runtime\caching\cache_utils.py", line 325, in _get_or_create_cached_value
+    return self._handle_cache_miss(cache, value_key, func_args, func_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\site-packages\streamlit\runtime\caching\cache_utils.py", line 384, in _handle_cache_miss
+    computed_value = self._info.func(*func_args, **func_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\AnimeHub\src\web\queries.py", line 196, in load_discover_csv
+    csv_path = get_settings().catalog_dir / "bilibili.csv"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\site-packages\pydantic\main.py", line 1042, in __getattr__
+    raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+AttributeError: 'Settings' object has no attribute 'catalog_dir'
+  Stopping...
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Scripts\anime-hub.exe\__main__.py", line 7, in <module>
+  File "F:\AnimeHub\src\main.py", line 177, in main
+    commands[args.command](args)
+  File "F:\AnimeHub\src\main.py", line 38, in cmd_web
+    subprocess.run(cmd)
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\subprocess.py", line 550, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\subprocess.py", line 1201, in communicate
+    self.wait()
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\subprocess.py", line 1264, in wait
+    return self._wait(timeout=timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\wong\AppData\Local\Programs\Python\Python312\Lib\subprocess.py", line 1588, in _wait
+    result = _winapi.WaitForSingleObject(self._handle,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

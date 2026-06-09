@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,6 +22,11 @@ from db.session import get_session, init_db
 from models.crawl_task import CrawlTask
 
 logger = logging.getLogger(__name__)
+
+
+def _print(text: str) -> None:
+    sys.stdout.buffer.write((text + "\n").encode(sys.stdout.encoding or "utf-8", errors="replace"))
+
 
 # 支持的平台标识列表
 SUPPORTED_PLATFORMS = {"bilibili"}
@@ -325,11 +331,11 @@ class TrackingTable:
         if diff.created:
             print(f"  [新建] ({len(diff.created)} 项):")
             for t in diff.created:
-                print(f"    [{t.platform}] {t.season_id} {t.title}")
+                _print(f"    [{t.platform}] {t.season_id} {t.title}")
         if diff.updated:
             print(f"  [更新] ({len(diff.updated)} 项):")
             for t in diff.updated:
-                print(f"    [{t.platform}] {t.season_id} {t.title}")
+                _print(f"    [{t.platform}] {t.season_id} {t.title}")
         if diff.paused:
             print(f"  [暂停] ({len(diff.paused)} 项):")
             for platform, sid in diff.paused:

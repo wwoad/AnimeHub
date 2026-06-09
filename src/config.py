@@ -17,7 +17,14 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 class Settings(BaseSettings):
     # === 数据库配置 ===
-    db_path: Path = _PROJECT_ROOT / "data" / "anime.db"
+    db_path: Path = _PROJECT_ROOT / "data" / "db" / "anime.db"
+
+    # === 数据目录配置 ===
+    catalog_dir: Path = _PROJECT_ROOT / "data" / "catalog"
+    archive_dir: Path = _PROJECT_ROOT / "data" / "archive"
+    monitor_dir: Path = _PROJECT_ROOT / "data" / "monitor"
+    monitor_config_file: Path = _PROJECT_ROOT / "data" / "monitor" / "config.json"
+    monitor_ep_file: Path = _PROJECT_ROOT / "data" / "monitor" / "ep.txt"
 
     # === 追踪表配置 ===
     tracking_file: Path = _PROJECT_ROOT / "data" / "tracking" / "bilibili.csv"
@@ -47,7 +54,8 @@ class Settings(BaseSettings):
     show_progress_bar: bool = True  # 硬编码默认值，可通过 ANIME_SHOW_PROGRESS_BAR 覆盖
 
     # === B站配置(Cookie 从环境变量 ANIME_BILIBILI_COOKIE 读取) ===
-    bilibili_cookie: str = ""
+    bilibili_cookie_1: str = ""
+    bilibili_cookie_2: str = ""
 
     model_config = {"env_prefix": "ANIME_", "env_file": ".env"}
 

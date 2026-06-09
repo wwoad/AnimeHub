@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 
 from core.orchestrator import Orchestrator
+from core.path_manager import raw_file_exists_today
 from core.pipeline import Pipeline
 from core.scheduler import Scheduler
 from db.repository import Repository
@@ -18,8 +20,11 @@ logger = logging.getLogger(__name__)
 
 async def _crawl_all(targets: list[tuple[int, str, str, int, int]]) -> None:
     """并发采集所有目标, 每个 slot 写入独立 worker DB 彻底消除锁竞争"""
+    import contextlib
+
     from client.factory import ClientFactory
     from config import get_settings
+    from utils.rate_limiter import RateLimiter
 
     settings = get_settings()
     max_concurrent = settings.max_concurrent_anime
@@ -27,23 +32,40 @@ async def _crawl_all(targets: list[tuple[int, str, str, int, int]]) -> None:
     pool = WorkerPool(n_workers=max_concurrent, db_path=settings.db_path)
     pool.setup()
 
-    async with ClientFactory.create("bilibili") as client:
+    shared_limiter = RateLimiter(rate=10, burst=12)
+    clients = [ClientFactory.create("bilibili", rate_limiter=shared_limiter)]
+    if settings.bilibili_cookie_2:
+        clients.append(ClientFactory.create("bilibili", headers={"Cookie": settings.bilibili_cookie_2}, rate_limiter=shared_limiter))
+        logger.info("双 Cookie 模式: %d 个客户端 (共享限速器)", len(clients))
 
-        async def _crawl_one(season_id: int, platform: str, title: str, priority: int, interval_minutes: int) -> None:
-            _ensure_task(season_id, platform, title, priority, interval_minutes)
-            slot = await pool.acquire()
-            try:
-                success = await _crawl_single(client, season_id, platform, pool, slot)
-                if success:
-                    logger.info("[%s-%s] 采集完成", season_id, title)
-                else:
-                    logger.warning("[%s-%s] 采集部分失败", season_id, title)
-            except Exception as e:
-                logger.error("[%s-%s] 采集失败: %s", season_id, title, e)
-            finally:
-                pool.release(slot)
+    async def _crawl_one(season_id: int, platform: str, title: str, priority: int, interval_minutes: int, client) -> None:
+        _ensure_task(season_id, platform, title, priority, interval_minutes)
 
-        await asyncio.gather(*[_crawl_one(*t) for t in targets])
+        if _was_crawled_today(season_id, title, platform):
+            logger.info("[%s-%s] 今天已成功采集，跳过", season_id, title)
+            return
+
+        slot = await pool.acquire()
+        try:
+            success = await _crawl_single(client, season_id, platform, pool, slot)
+            if success:
+                logger.info("[%s-%s] 采集完成", season_id, title)
+            else:
+                logger.warning("[%s-%s] 采集部分失败", season_id, title)
+        except Exception as e:
+            logger.error("[%s-%s] 采集失败: %s", season_id, title, e)
+        finally:
+            pool.release(slot)
+
+    tasks = []
+    for i, t in enumerate(targets):
+        client = clients[i % len(clients)]
+        tasks.append(_crawl_one(*t, client))
+
+    async with contextlib.AsyncExitStack() as stack:
+        for c in clients:
+            await stack.enter_async_context(c)
+        await asyncio.gather(*tasks)
 
     pool.merge()
     pool.cleanup()
@@ -63,8 +85,7 @@ async def _crawl_single(client, season_id: int, platform: str, pool: WorkerPool 
     if pool is not None and worker_idx is not None:
         ctx = pool.get_session(worker_idx)
     else:
-        from contextlib import nullcontext
-        ctx = nullcontext(get_session())  # type: ignore[assignment]
+        ctx = get_session()
 
     with ctx as session:
         repo = Repository(session)
@@ -83,6 +104,8 @@ async def _crawl_single(client, season_id: int, platform: str, pool: WorkerPool 
         task = repo.get_crawl_task(season_id)
         if task:
             if success:
+                if pipeline._raw_info and pipeline._raw_info.is_finish:
+                    task.interval_minutes = 24 * 60
                 repo.mark_task_success(task.id, task.interval_minutes)
             else:
                 repo.mark_task_failed(task.id, error_msg or "未知错误")
@@ -94,8 +117,26 @@ def cmd_crawl(args: any) -> None:
     """执行一次数据采集(无参数时直接读追踪CSV)"""
 
     if args.season_id:
-        orchestrator = Orchestrator()
         _ensure_task(args.season_id)
+
+        title = ""
+        platform = "bilibili"
+        with get_session() as session:
+            repo = Repository(session)
+            task = repo.get_crawl_task(args.season_id)
+            if task:
+                title = task.title or ""
+                platform = task.platform or "bilibili"
+            if not title:
+                anime = repo.get_anime(args.season_id)
+                if anime:
+                    title = anime.title or ""
+
+        if _was_crawled_today(args.season_id, title, platform):
+            logger.info("[%s] 今天已成功采集，跳过", args.season_id)
+            return
+
+        orchestrator = Orchestrator()
         success = asyncio.run(orchestrator.crawl_once(args.season_id))
         if success:
             logger.info("[%s] 采集完成", args.season_id)
@@ -112,6 +153,7 @@ def cmd_crawl(args: any) -> None:
         return
 
     targets: list[tuple[int, str, str, int, int]] = []
+    crawl_mode = getattr(args, "mode", "full")
     for csv_file in sorted(dir_path.glob("*.csv")):
         platform = csv_file.stem
         table = TrackingTable(csv_file)
@@ -119,13 +161,43 @@ def cmd_crawl(args: any) -> None:
         if not all_targets:
             continue
         active = [t for t in all_targets if not t.paused]
-        logger.info("[%s] 追踪 %d 项, 其中活跃 %d 项", platform, len(all_targets), len(active))
+        if crawl_mode == "fast":
+            active = [t for t in active if t.priority == 0]
+            logger.info("[%s] 追踪 %d 项, 其中活跃 %d 项, 快速模式过滤后 %d 项", platform, len(all_targets), len([t for t in all_targets if not t.paused]), len(active))
+        elif crawl_mode == "full":
+            active = [t for t in active if t.priority >= 1]
+            logger.info("[%s] 追踪 %d 项, 其中活跃 %d 项, 全量模式过滤后 %d 项", platform, len(all_targets), len([t for t in all_targets if not t.paused]), len(active))
+        else:
+            logger.info("[%s] 追踪 %d 项, 其中活跃 %d 项", platform, len(all_targets), len(active))
         for t in active:
             targets.append((t.season_id, t.platform, t.title, t.priority, t.interval_minutes))
 
     if targets:
         asyncio.run(_crawl_all(targets))
     logger.info("全量采集完成, 共 %d 项", len(targets))
+
+
+def _was_crawled_today(season_id: int, title: str = "", platform: str = "bilibili") -> bool:
+    """检查指定动画今天是否已成功采集过（DB AND 文件夹双重确认）
+
+    AND 逻辑: DB 有成功记录 且 文件夹有文件 → 跳过。
+    任一不满足 → 需要重采。
+    """
+    init_db()
+    with get_session() as session:
+        repo = Repository(session)
+        task = repo.get_crawl_task(season_id)
+        if not (task and task.status == "success" and task.last_crawled_at
+                and task.last_crawled_at.date() == datetime.now().date()):
+            return False
+
+    if not title:
+        return False
+
+    if not raw_file_exists_today(title, platform):
+        return False
+
+    return True
 
 
 def _ensure_task(season_id: int, platform: str = "bilibili", title: str = "", priority: int = 1, interval_minutes: int = 120) -> None:

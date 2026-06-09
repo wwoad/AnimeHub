@@ -21,6 +21,7 @@ class Episode(TimestampMixin, Base):
     title: Mapped[str] = mapped_column(String(100), default="", comment="集号")
     long_title: Mapped[str] = mapped_column(String(200), default="", comment="副标题")
     duration_ms: Mapped[int] = mapped_column(Integer, default=0, comment="时长(毫秒)")
+    episode_type: Mapped[str] = mapped_column(String(20), default="main", index=True, comment="集类型: main/trailer/special/misc")
     pub_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="发布时间")
     extra: Mapped[dict | None] = mapped_column(JSON, default=dict, comment="平台专有数据(徽章/分类/av号等)")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, comment="创建时间")

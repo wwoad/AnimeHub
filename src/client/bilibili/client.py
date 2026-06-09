@@ -12,8 +12,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-import random
 from typing import Any
 
 import httpx
@@ -34,6 +34,7 @@ _BILIBILI_SEASON_STAT_API = "https://api.bilibili.com/pgc/web/season/stat"
 _BILIBILI_VIDEO_STAT_API = "https://api.bilibili.com/x/web-interface/view"
 _BILIBILI_EP_STAT_API = "https://api.bilibili.com/pgc/season/episode/web/info"
 _BILIBILI_INDEX_API = "https://api.bilibili.com/pgc/season/index/result"
+_BILIBILI_ONLINE_API = "https://api.bilibili.com/x/player/online/total"
 
 # === 默认请求头 ===
 _DEFAULT_HEADERS = {
@@ -57,16 +58,17 @@ class BilibiliClient(BaseClient):
         self,
         max_concurrency: int | None = None,
         headers: dict[str, str] | None = None,
+        rate_limiter: RateLimiter | None = None,
     ) -> None:
         settings = get_settings()
         self._max_concurrency = max_concurrency or settings.max_concurrency
         self._headers = {**_DEFAULT_HEADERS, **(headers or {})}
-        if settings.bilibili_cookie:
-            self._headers["Cookie"] = settings.bilibili_cookie
+        if settings.bilibili_cookie_1 and "Cookie" not in self._headers:
+            self._headers["Cookie"] = settings.bilibili_cookie_1
 
         conns = settings.max_connections
 
-        self._limiter = RateLimiter(rate=10, burst=12)
+        self._limiter = rate_limiter or RateLimiter(rate=10, burst=12)
         self._semaphore = asyncio.Semaphore(self._max_concurrency)
         self._client = httpx.AsyncClient(
             headers=self._headers,
@@ -88,11 +90,6 @@ class BilibiliClient(BaseClient):
         await self.close()
 
     async def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """获取 Semaphore 槽位 + 令牌后发起请求
-
-        Semaphore 在 retry 外部, 确保重试期间不占槽位。
-        """
-        await asyncio.sleep(random.uniform(0, 0.03))
         await self._limiter.acquire()
         async with self._semaphore:
             return await self._request(url, params)
@@ -103,30 +100,35 @@ class BilibiliClient(BaseClient):
         reraise=True,
     )
     async def _request(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """实际 HTTP 请求, tenacity 重试在 Semaphore 外部"""
-        resp = await self._client.get(url, params=params)
+        for attempt in range(3):
+            resp = await self._client.get(url, params=params)
 
-        if resp.status_code == 412:
-            logger.warning("触发WAF(412), 等待30秒后重试: url=%s", url)
-            await asyncio.sleep(30)
+            if resp.status_code == 412:
+                logger.warning("触发WAF(412), 等待重试(attempt=%d): url=%s", attempt + 1, url)
+                if attempt < 2:
+                    await asyncio.sleep(5)
+                    continue
+                raise RuntimeError(f"WAF(412) persisted after 3 inner retries: {url}")
+
+            if resp.status_code == 429:
+                logger.warning("限流(429), 等待重试(attempt=%d): url=%s", attempt + 1, url)
+                if attempt < 2:
+                    await asyncio.sleep(3)
+                    continue
+                raise RuntimeError(f"Rate limit(429) persisted after 3 inner retries: {url}")
+
             resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                logger.warning(
+                    "API错误: code=%s msg=%s url=%s",
+                    data.get("code"),
+                    data.get("message"),
+                    url,
+                )
+            return data
 
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", "10"))
-            logger.warning("限流(429), 等待%ds后重试: url=%s", retry_after, url)
-            await asyncio.sleep(retry_after)
-            resp.raise_for_status()
-
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") != 0:
-            logger.warning(
-                "API错误: code=%s msg=%s url=%s",
-                data.get("code"),
-                data.get("message"),
-                url,
-            )
-        return data
+        return {"code": -1, "message": "max_retries"}
 
     # ============================================================
     # 搜索 API
@@ -195,7 +197,11 @@ class BilibiliClient(BaseClient):
     # ============================================================
 
     async def get_season_info(self, season_id: int) -> SeasonInfo | None:
-        """获取动画详情, 包含基本信息和集数列表"""
+        """获取动画详情, 包含基本信息和集数列表
+
+        主接口返回 sections 可能不含 episodes 子数组,
+        因此对每个 section 并发调用子接口补全集数。
+        """
         data = await self._get(_BILIBILI_SEASON_API, params={"season_id": season_id})
         if data.get("code") != 0:
             return None
@@ -211,6 +217,12 @@ class BilibiliClient(BaseClient):
         area_name = areas[0].get("name", "") if areas else ""
 
         new_ep = result.get("new_ep") or {}
+
+        sections = result.get("section", [])
+        logger.debug(
+            "season=%d sections=%d episodes_in_main=%d",
+            season_id, len(sections), len(result.get("episodes", [])),
+        )
 
         return SeasonInfo(
             season_id=result["season_id"],
@@ -234,7 +246,7 @@ class BilibiliClient(BaseClient):
             new_ep_title=new_ep.get("index", ""),
             new_ep_id=new_ep.get("id", 0),
             episodes=result.get("episodes", []),
-            sections=result.get("section", []),
+            sections=sections,
         )
 
     # ============================================================
@@ -318,7 +330,7 @@ class BilibiliClient(BaseClient):
             batch_size: 每批并发请求数, 默认 max(10, max_concurrency // 3)
         """
         if batch_size is None:
-            batch_size = max(8, self._max_concurrency // 5)
+            batch_size = max(15, self._max_concurrency // 2)
 
         results: list[dict | None] = [None] * len(ep_ids)
 
@@ -338,7 +350,7 @@ class BilibiliClient(BaseClient):
                 if progress_callback:
                     progress_callback()
 
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)
 
         return results
 
@@ -364,12 +376,76 @@ class BilibiliClient(BaseClient):
     # 分类索引 API
     # ============================================================
 
+    async def get_online_count(
+        self,
+        aid: int | None = None,
+        cid: int | None = None,
+        bvid: str | None = None,
+    ) -> int:
+        """获取视频实时在线人数
+
+        来源: x/player/online/total
+        注意: 必须同时传 aid+cid 或 bvid+cid
+        """
+        params: dict[str, str | int] = {}
+        if aid:
+            params["aid"] = aid
+        if bvid:
+            params["bvid"] = bvid
+        if cid:
+            params["cid"] = cid
+
+        if not params or "cid" not in params:
+            return 0
+
+        data = await self._get(_BILIBILI_ONLINE_API, params=params)
+        if data.get("code") != 0:
+            return 0
+
+        result = data.get("data", {})
+        if not result:
+            return 0
+
+        total = result.get("total")
+        if total is not None:
+            try:
+                return int(str(total))
+            except (ValueError, TypeError):
+                pass
+
+        return 0
+
+    async def get_online_counts_batch(
+        self,
+        video_refs: list[dict],
+    ) -> list[int]:
+        """批量获取多个视频的在线人数
+
+        Args:
+            video_refs: [{"aid": xxx, "cid": xxx, "bvid": "xxx"}, ...]
+
+        Returns:
+            与 video_refs 等长的在线人数列表
+        """
+        results: list[int] = [0] * len(video_refs)
+
+        async def _fetch(index: int, ref: dict) -> None:
+            with contextlib.suppress(Exception):
+                results[index] = await self.get_online_count(
+                    aid=ref.get("aid"),
+                    cid=ref.get("cid"),
+                    bvid=ref.get("bvid"),
+                )
+
+        tasks = [_fetch(i, ref) for i, ref in enumerate(video_refs)]
+        await asyncio.gather(*tasks)
+        return results
+
     async def browse_seasons(
         self,
         season_type: int = 4,
         order: int = 2,
         pagesize: int = 50,
-        max_pages: int = 50,
     ) -> list[CatalogResult]:
         """浏览分类索引, 自动翻页获取全部结果
 
@@ -377,12 +453,12 @@ class BilibiliClient(BaseClient):
             season_type: 分类类型 (1=番剧, 4=国创)
             order: 排序方式 (2=追番数, 3=播放量, 5=评分)
             pagesize: 每页条数 (最大50)
-            max_pages: 最大翻页数, 防止无限循环
         """
         all_results: list[CatalogResult] = []
         page = 1
+        _max_safe_page = 500
 
-        while page <= max_pages:
+        while page <= _max_safe_page:
             data = await self._get(
                 _BILIBILI_INDEX_API,
                 params={

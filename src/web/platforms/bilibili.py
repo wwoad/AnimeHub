@@ -32,7 +32,7 @@ def _fmt_label(n: float) -> str:
     return f"{n:,.0f}"
 
 
-_METRIC_CN = {"views": "播放量", "follow": "追番", "danmaku": "弹幕", "likes": "点赞", "coins": "投币"}
+_METRIC_CN = {"views": "播放量", "follow": "追番", "danmaku": "弹幕", "reply": "评论", "likes": "点赞", "coins": "投币"}
 
 _BAR_COLOR = "#448AFF"
 

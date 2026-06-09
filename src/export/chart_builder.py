@@ -94,7 +94,7 @@ class ChartBuilder:
             return None
         fig, ax = plt.subplots(figsize=(12, 6))
         ax.plot(diff["日期"], diff["总播放量"], "b-o", markersize=4, linewidth=2)
-        ax.set_title("播放量增长趋势")
+        ax.set_title("播放量增长趋势", y=1.02)
         ax.set_xlabel("日期")
         ax.set_ylabel("累计播放量")
         ax.ticklabel_format(axis="y", style="plain")
@@ -129,7 +129,7 @@ class ChartBuilder:
                     color=color,
                 )
 
-        ax.set_title("每日数据增量")
+        ax.set_title("每日数据增量", y=1.02)
         ax.set_xlabel("日期")
         ax.set_ylabel("数量")
         ax.set_xticks([xi + bar_width for xi in x])
@@ -159,7 +159,7 @@ class ChartBuilder:
         ax.set_yticks(y_pos)
         ax.set_yticklabels(labels)
         ax.set_xlabel("播放量")
-        ax.set_title("单集播放量排行 Top20")
+        ax.set_title("单集播放量排行 Top20", y=1.02)
         ax.ticklabel_format(axis="x", style="plain")
         ax.xaxis.set_major_formatter(
             lambda x, _: f"{x / 1e8:.2f}亿" if x >= 1e8 else f"{x / 1e4:.1f}万" if x >= 1e4 else str(int(x))
@@ -187,7 +187,7 @@ class ChartBuilder:
             ax2.plot(diff["日期"], diff[fav_col], "r-s", markersize=4, linewidth=2, label="追番/订阅数")
             ax2.set_ylabel("追番/订阅数", color="r")
 
-        ax1.set_title("播放量 & 追番数趋势")
+        ax1.set_title("播放量 & 追番数趋势", y=1.02)
         ax1.set_xlabel("日期")
         fig.autofmt_xdate()
         fig.tight_layout()

@@ -10,7 +10,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from functools import lru_cache
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from config import get_settings
@@ -43,8 +43,29 @@ def get_session_factory() -> sessionmaker[Session]:
 
 def init_db() -> None:
     """初始化数据库, 创建所有尚未创建的表"""
+    from models.fanren_monitor import FanrenMonitorLog  # noqa: F401 确保新表注册到Base
+
     engine = get_engine()
     Base.metadata.create_all(engine)
+    _migrate_db(engine)
+
+
+def _migrate_db(engine) -> None:
+    """手动执行数据库迁移（添加新列等）"""
+    with engine.connect() as conn:
+        result = conn.execute(text("PRAGMA table_info(anime_stat)"))
+        columns = {row[1] for row in result.fetchall()}
+        if "reply" not in columns:
+            conn.execute(text("ALTER TABLE anime_stat ADD COLUMN reply BIGINT DEFAULT 0"))
+            conn.commit()
+
+        result = conn.execute(text("PRAGMA table_info(episode)"))
+        ep_cols = {row[1] for row in result.fetchall()}
+        if "episode_type" not in ep_cols:
+            conn.execute(text("ALTER TABLE episode ADD COLUMN episode_type VARCHAR(20) DEFAULT 'main'"))
+            conn.execute(text("UPDATE episode SET episode_type = COALESCE(json_extract(extra, '$.episode_type'), 'main')"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episode_type ON episode(episode_type)"))
+            conn.commit()
 
 
 @contextmanager

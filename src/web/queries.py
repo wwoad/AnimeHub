@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import pandas as pd
+import streamlit as st
 from sqlalchemy import func
 
 from config import get_settings
@@ -21,6 +24,7 @@ def _ensure_db() -> None:
     init_db()
 
 
+@st.cache_data(ttl=120)
 def get_anime_list() -> pd.DataFrame:
     """获取所有跟踪动画列表(含最新统计)
 
@@ -39,13 +43,18 @@ def get_anime_list() -> pd.DataFrame:
         animes = session.query(Anime).filter(Anime.season_id.in_(season_ids)).all()
         anime_map = {a.season_id: a for a in animes}
 
-        ep_counts = (
-            session.query(Episode.anime_id, func.count(Episode.ep_id))
+        merged = (
+            session.query(
+                Episode.anime_id,
+                func.count(Episode.ep_id).label("total"),
+                func.sum(func.iif(Episode.episode_type == "main", 1, 0)).label("main"),
+            )
             .filter(Episode.anime_id.in_(season_ids))
             .group_by(Episode.anime_id)
             .all()
         )
-        ep_count_map = {anime_id: count for anime_id, count in ep_counts}
+        ep_count_map = {anime_id: total for anime_id, total, _ in merged}
+        main_ep_count_map = {anime_id: main_count for anime_id, _, main_count in merged}
 
         subq = (
             session.query(
@@ -77,6 +86,7 @@ def get_anime_list() -> pd.DataFrame:
                     "area": a.area if a else "",
                     "rating_score": float(a.rating_score) if (a and a.rating_score is not None) else 0.0,
                     "total_episodes": max(int(a.total_episodes) if (a and a.total_episodes is not None) else 0, ep_count_map.get(t.season_id, 0)),
+                    "main_ep_count": max(int(a.total_episodes) if (a and a.total_episodes is not None) else 0, main_ep_count_map.get(t.season_id, 0)),
                     "is_finish": "完结" if (a and a.is_finish) else "连载中",
                     "views": s.views if s else 0,
                     "follow": s.follow if s else 0,
@@ -84,16 +94,19 @@ def get_anime_list() -> pd.DataFrame:
                     "likes": s.likes if s else 0,
                     "coins": s.coins if s else 0,
                     "favorite": s.favorite if s else 0,
+                    "reply": getattr(s, "reply", 0) if s else 0,
                     "share": s.share if s else 0,
                     "status": str({"pending": "待采集", "running": "采集中", "success": "成功", "failed": "失败"}.get(t.status or "pending", "待采集")),
                     "last_crawled": str(t.last_crawled_at.strftime("%m-%d %H:%M")) if t.last_crawled_at else "未采集",
                     "paused": t.paused if t.paused is not None else False,
+                    "priority": t.priority,
                 }
             )
 
         return pd.DataFrame(rows)
 
 
+@st.cache_data(ttl=300)
 def get_anime_detail(season_id: int) -> dict:
     """获取单动画详情(基本信息+最新统计+集数列表)"""
     _ensure_db()
@@ -148,6 +161,7 @@ def get_anime_detail(season_id: int) -> dict:
         }
 
 
+@st.cache_data(ttl=300)
 def get_anime_stat_history(season_id: int, days: int = 30) -> pd.DataFrame:
     """获取动画统计历史趋势"""
     from datetime import datetime, timedelta
@@ -176,9 +190,10 @@ def get_anime_stat_history(season_id: int, days: int = 30) -> pd.DataFrame:
         return pd.DataFrame(rows)
 
 
+@st.cache_data(ttl=600)
 def load_discover_csv() -> pd.DataFrame:
     """加载发现列表CSV"""
-    csv_path = get_settings().db_path.parent / "anime_info" / "bilibili.csv"
+    csv_path = get_settings().catalog_dir / "bilibili.csv"
     if not csv_path.exists():
         return pd.DataFrame()
 
@@ -253,6 +268,40 @@ def update_csv_paused(season_ids: list[int], paused: bool) -> None:
         for row in reader:
             if int(row.get("season_id", 0)) in season_ids:
                 row["paused"] = "true" if paused else "false"
+            rows.append(row)
+
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv_mod.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def update_tracking_priority(season_id: int, priority: int) -> None:
+    """更新追踪任务的采集优先级"""
+    from db.repository import Repository
+    from db.session import get_session
+
+    with get_session() as session:
+        repo = Repository(session)
+        repo.set_priority(season_id, priority=priority)
+
+
+def update_csv_priority(season_ids: list[int], priority: int) -> None:
+    """更新CSV中指定项的优先级"""
+    import csv as csv_mod
+
+    from config import get_settings
+
+    csv_path = get_settings().tracking_dir / "bilibili.csv"
+    if not csv_path.exists():
+        return
+
+    rows = []
+    with open(csv_path, encoding="utf-8-sig") as f:
+        reader = csv_mod.DictReader(f)
+        for row in reader:
+            if int(row.get("season_id", 0)) in season_ids:
+                row["priority"] = str(priority)
             rows.append(row)
 
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
@@ -336,3 +385,81 @@ def add_to_tracking(selected_ids: list[int], title_map: dict[int, str] | None = 
                     repo.add_crawl_task(task)
 
     return added_count
+
+
+@st.cache_data(ttl=300)
+def get_daily_deltas(season_ids: list[int]) -> dict:
+    """获取平台级日增量数据
+
+    对每部动画取昨日和昨昨日的最后一次快照，全平台累加后计算增量与环比。
+
+    Returns:
+        dict: views_delta, views_pct, follow_delta, follow_pct, ...
+    """
+    _ensure_db()
+    Session = get_session_factory()
+    with Session() as session:
+        now = datetime.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_start = today_start - timedelta(days=1)
+        dby_start = today_start - timedelta(days=2)
+
+        def _day_sum(day_start, day_end):
+            subq = (
+                session.query(
+                    AnimeStat.anime_id,
+                    func.max(AnimeStat.id).label("max_id"),
+                )
+                .filter(AnimeStat.captured_at >= day_start)
+                .filter(AnimeStat.captured_at < day_end)
+                .filter(AnimeStat.anime_id.in_(season_ids))
+                .group_by(AnimeStat.anime_id)
+                .subquery()
+            )
+            sums = (
+                session.query(
+                    func.sum(AnimeStat.views),
+                    func.sum(AnimeStat.follow),
+                    func.sum(AnimeStat.danmaku),
+                    func.sum(AnimeStat.reply),
+                    func.sum(AnimeStat.likes),
+                    func.sum(AnimeStat.coins),
+                )
+                .join(subq, AnimeStat.id == subq.c.max_id)
+                .first()
+            )
+            return {
+                "views": int(sums[0] or 0),
+                "follow": int(sums[1] or 0),
+                "danmaku": int(sums[2] or 0),
+                "reply": int(sums[3] or 0),
+                "likes": int(sums[4] or 0),
+                "coins": int(sums[5] or 0),
+            }
+
+        yesterday = _day_sum(yesterday_start, today_start)
+        dby = _day_sum(dby_start, yesterday_start)
+
+        result: dict[str, int | float] = {}
+        for field in ("views", "follow", "danmaku", "reply", "likes", "coins"):
+            delta = yesterday[field] - dby[field]
+            pct = round(delta / dby[field] * 1000, 1) if dby[field] > 0 else 0.0
+            result[f"{field}_delta"] = delta
+            result[f"{field}_pct"] = pct
+
+        return result
+
+
+@st.cache_data(ttl=600)
+def get_main_ep_total_duration(season_ids: list[int]) -> int:
+    """获取所有正片的总时长（毫秒）"""
+    _ensure_db()
+    Session = get_session_factory()
+    with Session() as session:
+        total = (
+            session.query(func.sum(Episode.duration_ms))
+            .filter(Episode.episode_type == "main")
+            .filter(Episode.anime_id.in_(season_ids))
+            .scalar()
+        )
+        return int(total or 0)

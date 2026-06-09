@@ -78,6 +78,7 @@ class SeasonStat(BaseModel):
     danmaku: int = Field(default=0, description="弹幕总数")
     shares: int = Field(default=0, description="分享总数")
     favorite: int = Field(default=0, description="收藏总数")
+    reply: int = Field(default=0, description="评论总数")
 
 
 class VideoStat(BaseModel):

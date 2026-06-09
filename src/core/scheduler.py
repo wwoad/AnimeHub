@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from datetime import datetime
 
 from client.factory import ClientFactory
 from config import get_settings
+from core.path_manager import raw_file_exists_today
 from core.pipeline import Pipeline
 from db.repository import Repository
 from db.session import get_session, init_db
@@ -80,6 +82,12 @@ class Scheduler:
         for task in due_tasks:
             if not self._running:
                 break
+
+            if task.status == "success" and task.last_crawled_at \
+                    and task.last_crawled_at.date() == datetime.now().date() \
+                    and task.title and raw_file_exists_today(task.title, task.platform):
+                logger.info("[%s-%s] 今天已成功采集，跳过", task.season_id, task.title)
+                continue
 
             try:
                 async with ClientFactory.create(platform=task.platform) as client:

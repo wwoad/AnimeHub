@@ -43,14 +43,28 @@ class WorkerPool:
         self._slots: asyncio.Queue[int] = asyncio.Queue()
         self._engines: dict[int, object] = {}
         self._session_factories: dict[int, object] = {}
+        self._max_anime_stat_id = 0
+        self._max_episode_stat_id = 0
 
     def setup(self) -> None:
         """复制主库到每个 worker, 初始化 slot 队列"""
+
         self.workers_dir.mkdir(parents=True, exist_ok=True)
 
-        # 清旧 worker 文件
+        # 清旧 worker 文件（跳过被其他进程锁定的）
         for p in self.workers_dir.glob("worker_*.db*"):
-            p.unlink()
+            with suppress(OSError):
+                p.unlink()
+
+        # WAL checkpoint: 确保所有已提交数据写入 .db 文件, worker 复制才完整
+        main_engine = create_engine(f"sqlite:///{self.main_db}", echo=False, connect_args={"timeout": 30})
+        with main_engine.connect() as conn:
+            conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+            self._max_anime_stat_id = conn.execute(text("SELECT COALESCE(MAX(id), 0) FROM anime_stat")).scalar() or 0
+            self._max_episode_stat_id = conn.execute(text("SELECT COALESCE(MAX(id), 0) FROM episode_stat")).scalar() or 0
+        main_engine.dispose()
+        logger.info("WorkerPool: WAL checkpoint done, max_id: anime_stat=%d episode_stat=%d",
+                     self._max_anime_stat_id, self._max_episode_stat_id)
 
         for i in range(self.n_workers):
             worker_path = self.workers_dir / f"worker_{i}.db"
@@ -120,9 +134,9 @@ class WorkerPool:
                     conn.execute(text(f"ATTACH DATABASE '{worker}' AS w{i}"))
 
                     _merge_anime(conn, i)
-                    _merge_anime_stat(conn, i)
+                    _merge_anime_stat(conn, i, self._max_anime_stat_id)
                     _merge_episode(conn, i)
-                    _merge_episode_stat(conn, i)
+                    _merge_episode_stat(conn, i, self._max_episode_stat_id)
                     _merge_crawl_task(conn, i)
 
                     conn.execute(text(f"DETACH DATABASE w{i}"))
@@ -137,7 +151,8 @@ class WorkerPool:
     def cleanup(self) -> None:
         """删除所有 worker DB 文件"""
         for p in self.workers_dir.glob("worker_*.db*"):
-            p.unlink()
+            with suppress(OSError):
+                p.unlink()
         with suppress(OSError):
             self.workers_dir.rmdir()
 
@@ -146,12 +161,13 @@ def _merge_anime(conn, alias_idx: int) -> None:
     conn.execute(text(f"""INSERT OR REPLACE INTO main.anime SELECT * FROM w{alias_idx}.anime"""))
 
 
-def _merge_anime_stat(conn, alias_idx: int) -> None:
+def _merge_anime_stat(conn, alias_idx: int, max_id: int) -> None:
     conn.execute(text(f"""
         INSERT INTO main.anime_stat
         (anime_id, views, follow, danmaku, likes, coins, share, favorite, extra, captured_at)
         SELECT anime_id, views, follow, danmaku, likes, coins, share, favorite, extra, captured_at
         FROM w{alias_idx}.anime_stat
+        WHERE id > {max_id}
     """))
 
 
@@ -159,12 +175,13 @@ def _merge_episode(conn, alias_idx: int) -> None:
     conn.execute(text(f"""INSERT OR REPLACE INTO main.episode SELECT * FROM w{alias_idx}.episode"""))
 
 
-def _merge_episode_stat(conn, alias_idx: int) -> None:
+def _merge_episode_stat(conn, alias_idx: int, max_id: int) -> None:
     conn.execute(text(f"""
         INSERT INTO main.episode_stat
         (episode_id, views, danmaku, reply, favorite, likes, coins, share, extra, captured_at)
         SELECT episode_id, views, danmaku, reply, favorite, likes, coins, share, extra, captured_at
         FROM w{alias_idx}.episode_stat
+        WHERE id > {max_id}
     """))
 
 
@@ -174,7 +191,8 @@ def _merge_crawl_task(conn, alias_idx: int) -> None:
             last_crawled_at = (SELECT last_crawled_at FROM w{alias_idx}.crawl_task w WHERE w.season_id = main.crawl_task.season_id),
             next_crawl_at = (SELECT next_crawl_at FROM w{alias_idx}.crawl_task w WHERE w.season_id = main.crawl_task.season_id),
             status = (SELECT status FROM w{alias_idx}.crawl_task w WHERE w.season_id = main.crawl_task.season_id),
-            error_msg = (SELECT error_msg FROM w{alias_idx}.crawl_task w WHERE w.season_id = main.crawl_task.season_id),
-            fail_count = (SELECT fail_count FROM w{alias_idx}.crawl_task w WHERE w.season_id = main.crawl_task.season_id)
+            last_error = (SELECT last_error FROM w{alias_idx}.crawl_task w WHERE w.season_id = main.crawl_task.season_id),
+            fail_count = (SELECT fail_count FROM w{alias_idx}.crawl_task w WHERE w.season_id = main.crawl_task.season_id),
+            interval_minutes = (SELECT interval_minutes FROM w{alias_idx}.crawl_task w WHERE w.season_id = main.crawl_task.season_id)
         WHERE EXISTS (SELECT 1 FROM w{alias_idx}.crawl_task w WHERE w.season_id = main.crawl_task.season_id)
     """))

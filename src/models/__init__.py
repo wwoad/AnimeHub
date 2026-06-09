@@ -9,6 +9,7 @@ from .base import Base
 from .crawl_task import CrawlTask
 from .episode import Episode
 from .episode_stat import EpisodeStat
+from .fanren_monitor import FanrenMonitorLog
 
 __all__ = [
     "Base",
@@ -17,4 +18,5 @@ __all__ = [
     "Episode",
     "EpisodeStat",
     "CrawlTask",
+    "FanrenMonitorLog",
 ]

@@ -217,6 +217,7 @@ class Repository:
                 status="success",
                 last_crawled_at=now,
                 next_crawl_at=next_time,
+                interval_minutes=interval_minutes,
                 fail_count=0,
                 last_error=None,
                 updated_at=now,
@@ -250,6 +251,15 @@ class Repository:
         if task is None:
             return None
         task.paused = not task.paused if paused is None else paused
+        task.updated_at = datetime.now()
+        self._session.flush()
+        return task
+
+    def set_priority(self, season_id: int, priority: int) -> CrawlTask | None:
+        task = self.get_crawl_task(season_id)
+        if task is None:
+            return None
+        task.priority = priority
         task.updated_at = datetime.now()
         self._session.flush()
         return task

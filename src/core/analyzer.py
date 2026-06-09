@@ -127,8 +127,8 @@ class Analyzer:
             platform = anime.platform if anime else "bilibili"
 
             all_episodes = repo.get_episodes(season_id)
-            # 按 section_type 过滤正片(存在 extra 中)
-            episodes = [e for e in all_episodes if (e.extra or {}).get("section_type", 0) == 0]
+            # 过滤来自 info.episodes 的集(section_id==0), 不含 sections 中的视频
+            episodes = [e for e in all_episodes if (e.extra or {}).get("section_id", 0) == 0]
             if not episodes:
                 episodes = all_episodes
 
@@ -163,7 +163,7 @@ class Analyzer:
                             "播放量": stat.views,
                             "弹幕数": stat.danmaku,
                             "点赞数": stat.likes,
-                            "评论数": stat.reply,
+                            "评论数": getattr(stat, "reply", 0),
                             "收藏数": stat.favorite,
                             "分享数": stat.share,
                         }
